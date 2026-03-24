@@ -499,8 +499,7 @@ mod tests {
             serde_json::json!({"_id": "d2", "name": "a1c", "notes": "unchanged"}),
         ] {
             let doc_id = writer::make_doc_id(doc_json);
-            let doc =
-                writer::build_document(&tv_schema, &schema, doc_json, &doc_id).unwrap();
+            let doc = writer::build_document(&tv_schema, &schema, doc_json, &doc_id).unwrap();
             writer::upsert_document(&w, id_field, doc, &doc_id);
         }
         w.commit().unwrap();
@@ -557,9 +556,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (index, _, _) = setup_test_index(dir.path());
 
-        let gap_rows = vec![
-            serde_json::json!({"_id": "d1", "name": "UPDATED", "notes": "new version"}),
-        ];
+        let gap_rows =
+            vec![serde_json::json!({"_id": "d1", "name": "UPDATED", "notes": "new version"})];
 
         let doc = get_with_gap(&index, "d1", &gap_rows).unwrap();
         assert!(doc.is_some());
@@ -571,8 +569,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (index, _, _) = setup_test_index(dir.path());
 
-        let gap_rows =
-            vec![serde_json::json!({"_id": "d99", "name": "unrelated"})];
+        let gap_rows = vec![serde_json::json!({"_id": "d99", "name": "unrelated"})];
 
         let doc = get_with_gap(&index, "d2", &gap_rows).unwrap();
         assert!(doc.is_some());

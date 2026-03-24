@@ -6,6 +6,7 @@ use crate::storage::Storage;
 use crate::OutputFormat;
 
 /// Execute a search query against an index and print results.
+/// Searches both the persistent index and gap rows (two-tier).
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     storage: &Storage,
@@ -16,6 +17,7 @@ pub fn run(
     fields: Option<Vec<String>>,
     include_score: bool,
     fmt: OutputFormat,
+    gap_rows: &[serde_json::Value],
 ) -> Result<()> {
     if !storage.exists(name) {
         return Err(SearchDbError::IndexNotFound(name.to_string()));
@@ -24,7 +26,7 @@ pub fn run(
     let config = storage.load_config(name)?;
     let index = Index::open_in_dir(storage.tantivy_dir(name))?;
 
-    let results = searcher::search(
+    let results = searcher::search_with_gap(
         &index,
         &config.schema,
         query,
@@ -32,6 +34,7 @@ pub fn run(
         offset,
         fields.as_deref(),
         include_score,
+        gap_rows,
     )?;
 
     match fmt {
@@ -45,11 +48,9 @@ pub fn run(
                 eprintln!("[searchdb] No results");
                 return Ok(());
             }
-            // Collect field names from first result for column headers
             let first = results[0].doc.as_object().unwrap();
             let cols: Vec<&String> = first.keys().collect();
 
-            // Print header
             let header: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
             println!("{}", header.join("\t"));
             println!(
@@ -61,7 +62,6 @@ pub fn run(
                     .join("\t")
             );
 
-            // Print rows
             for hit in &results {
                 let obj = hit.doc.as_object().unwrap();
                 let row: Vec<String> = cols

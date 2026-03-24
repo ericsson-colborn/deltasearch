@@ -6,15 +6,14 @@ use crate::storage::Storage;
 use crate::OutputFormat;
 
 /// Retrieve a single document by _id with optional field projection.
-///
-/// Prints the document to stdout.
-/// Exits with code 3 (not found) if no document matches.
+/// Checks gap rows first (newer data), falls back to persistent index.
 pub fn run(
     storage: &Storage,
     name: &str,
     doc_id: &str,
     fields: Option<Vec<String>>,
     fmt: OutputFormat,
+    gap_rows: &[serde_json::Value],
 ) -> Result<()> {
     if !storage.exists(name) {
         return Err(SearchDbError::IndexNotFound(name.to_string()));
@@ -22,7 +21,7 @@ pub fn run(
 
     let index = Index::open_in_dir(storage.tantivy_dir(name))?;
 
-    match searcher::get_by_id(&index, doc_id)? {
+    match searcher::get_with_gap(&index, doc_id, gap_rows)? {
         Some(mut doc) => {
             // Apply field projection
             if let Some(ref field_list) = fields {

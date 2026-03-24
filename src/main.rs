@@ -185,16 +185,22 @@ async fn run_cli() {
             fields,
             score,
         } => {
-            auto_sync(&storage, &name).await;
-            commands::search::run(&storage, &name, &query, limit, offset, fields, score, fmt)
+            let (gap_rows, gap_versions) = read_gap(&storage, &name).await;
+            let result = commands::search::run(
+                &storage, &name, &query, limit, offset, fields, score, fmt, &gap_rows,
+            );
+            maybe_spawn_sync(&cli.data_dir, &name, gap_versions);
+            result
         }
         Commands::Get {
             name,
             doc_id,
             fields,
         } => {
-            auto_sync(&storage, &name).await;
-            commands::get::run(&storage, &name, &doc_id, fields, fmt)
+            let (gap_rows, gap_versions) = read_gap(&storage, &name).await;
+            let result = commands::get::run(&storage, &name, &doc_id, fields, fmt, &gap_rows);
+            maybe_spawn_sync(&cli.data_dir, &name, gap_versions);
+            result
         }
         Commands::Stats { name } => commands::stats::run(&storage, &name, fmt),
         Commands::Drop { name } => commands::drop::run(&storage, &name),
@@ -213,20 +219,64 @@ async fn run_cli() {
     handle_error(result, fmt);
 }
 
-/// Auto-sync from Delta before search/get if a Delta source is configured.
-/// Silently skips if no Delta source or if already up to date.
+/// Read un-indexed Delta rows (the gap between index_version and HEAD).
+/// Returns (gap_rows, gap_size_in_versions) without acquiring any lock.
 #[cfg(feature = "delta")]
-async fn auto_sync(storage: &Storage, name: &str) {
+async fn read_gap(storage: &Storage, name: &str) -> (Vec<serde_json::Value>, i64) {
     if !storage.exists(name) {
+        return (vec![], 0);
+    }
+    let config = match storage.load_config(name) {
+        Ok(c) => c,
+        Err(_) => return (vec![], 0),
+    };
+    let source = match config.delta_source.as_deref() {
+        Some(s) => s,
+        None => return (vec![], 0),
+    };
+
+    let delta_sync = crate::delta::DeltaSync::new(source);
+    let current_version = match delta_sync.current_version().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[searchdb] Delta read warning: {e}");
+            return (vec![], 0);
+        }
+    };
+    let index_version = config.index_version.unwrap_or(-1);
+
+    if current_version <= index_version {
+        return (vec![], 0);
+    }
+
+    let gap_versions = current_version - index_version;
+    let rows = match delta_sync.rows_added_since(index_version).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[searchdb] Delta gap read warning: {e}");
+            return (vec![], gap_versions);
+        }
+    };
+    (rows, gap_versions)
+}
+
+/// Fire-and-forget background sync if gap exceeds threshold.
+#[cfg(feature = "delta")]
+fn maybe_spawn_sync(data_dir: &str, name: &str, gap_versions: i64) {
+    const GAP_THRESHOLD: i64 = 10;
+    if gap_versions <= GAP_THRESHOLD {
         return;
     }
-    if let Ok(config) = storage.load_config(name) {
-        if config.delta_source.is_some() {
-            if let Err(e) = commands::sync::run(storage, name).await {
-                eprintln!("[searchdb] Auto-sync warning: {e}");
-            }
-        }
-    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let _ = std::process::Command::new(exe)
+        .args(["sync", name, "--data-dir", data_dir])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 #[cfg(not(feature = "delta"))]
@@ -250,12 +300,22 @@ fn run_cli_sync() {
             offset,
             fields,
             score,
-        } => commands::search::run(&storage, &name, &query, limit, offset, fields, score, fmt),
+        } => commands::search::run(
+            &storage,
+            &name,
+            &query,
+            limit,
+            offset,
+            fields,
+            score,
+            fmt,
+            &[],
+        ),
         Commands::Get {
             name,
             doc_id,
             fields,
-        } => commands::get::run(&storage, &name, &doc_id, fields, fmt),
+        } => commands::get::run(&storage, &name, &doc_id, fields, fmt, &[]),
         Commands::Stats { name } => commands::stats::run(&storage, &name, fmt),
         Commands::Drop { name } => commands::drop::run(&storage, &name),
     };
@@ -275,7 +335,6 @@ fn handle_error(result: error::Result<()>, fmt: OutputFormat) {
                 eprintln!("[searchdb] Error: {e}");
             }
         }
-        // Exit code 1 for general errors; get command handles 3 (not found) itself
         std::process::exit(1);
     }
 }
