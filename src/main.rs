@@ -202,7 +202,10 @@ async fn run_cli() {
             maybe_spawn_sync(&cli.data_dir, &name, gap_versions);
             result
         }
-        Commands::Stats { name } => commands::stats::run(&storage, &name, fmt),
+        Commands::Stats { name } => {
+            let gap_info = read_gap_info(&storage, &name).await;
+            commands::stats::run(&storage, &name, fmt, gap_info)
+        }
         Commands::Drop { name } => commands::drop::run(&storage, &name),
         Commands::ConnectDelta {
             name,
@@ -279,6 +282,17 @@ fn maybe_spawn_sync(data_dir: &str, name: &str, gap_versions: i64) {
         .spawn();
 }
 
+/// Read Delta version info for stats display.
+#[cfg(feature = "delta")]
+async fn read_gap_info(storage: &Storage, name: &str) -> Option<(i64, i64)> {
+    let config = storage.load_config(name).ok()?;
+    let source = config.delta_source.as_deref()?;
+    let delta_sync = crate::delta::DeltaSync::new(source);
+    let delta_version = delta_sync.current_version().await.ok()?;
+    let index_version = config.index_version.unwrap_or(-1);
+    Some((delta_version, delta_version - index_version))
+}
+
 #[cfg(not(feature = "delta"))]
 fn run_cli_sync() {
     env_logger::init();
@@ -316,7 +330,7 @@ fn run_cli_sync() {
             doc_id,
             fields,
         } => commands::get::run(&storage, &name, &doc_id, fields, fmt, &[]),
-        Commands::Stats { name } => commands::stats::run(&storage, &name, fmt),
+        Commands::Stats { name } => commands::stats::run(&storage, &name, fmt, None),
         Commands::Drop { name } => commands::drop::run(&storage, &name),
     };
 

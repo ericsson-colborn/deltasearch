@@ -5,7 +5,13 @@ use crate::storage::Storage;
 use crate::OutputFormat;
 
 /// Print index statistics.
-pub fn run(storage: &Storage, name: &str, fmt: OutputFormat) -> Result<()> {
+/// `gap_info` is `Some((delta_version, gap_versions))` when a Delta source is connected.
+pub fn run(
+    storage: &Storage,
+    name: &str,
+    fmt: OutputFormat,
+    gap_info: Option<(i64, i64)>,
+) -> Result<()> {
     if !storage.exists(name) {
         return Err(SearchDbError::IndexNotFound(name.to_string()));
     }
@@ -26,29 +32,36 @@ pub fn run(storage: &Storage, name: &str, fmt: OutputFormat) -> Result<()> {
 
     match fmt {
         OutputFormat::Json => {
-            let stats = serde_json::json!({
+            let mut stats = serde_json::json!({
                 "index": name,
                 "num_docs": num_docs,
                 "num_segments": num_segments,
                 "fields": &config.schema.fields,
-                "delta_source": config.delta_source,
                 "index_version": config.index_version,
             });
+            if let Some((delta_ver, gap_ver)) = gap_info {
+                stats["delta_version"] = serde_json::json!(delta_ver);
+                stats["gap_versions"] = serde_json::json!(gap_ver);
+            }
             println!("{}", serde_json::to_string(&stats)?);
         }
         OutputFormat::Text => {
             println!("Index:      {name}");
             println!("Documents:  {num_docs}");
             println!("Segments:   {num_segments}");
+            if let Some(v) = config.index_version {
+                if let Some((delta_ver, gap_ver)) = gap_info {
+                    println!("Version:    {v} (Delta HEAD: {delta_ver}, gap: {gap_ver} versions)");
+                } else {
+                    println!("Version:    {v}");
+                }
+            }
             println!("Fields:");
             for (field_name, field_type) in &config.schema.fields {
                 println!("  {field_name}: {field_type:?}");
             }
             if let Some(ref src) = config.delta_source {
                 println!("Delta:      {src}");
-                if let Some(v) = config.index_version {
-                    println!("Version:    {v}");
-                }
             }
         }
     }
@@ -67,7 +80,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path().to_str().unwrap());
         new_index::run(&storage, "test", r#"{"fields":{"name":"keyword"}}"#, false).unwrap();
-        run(&storage, "test", OutputFormat::Json).unwrap();
+        run(&storage, "test", OutputFormat::Json, None).unwrap();
     }
 
     #[test]
@@ -82,7 +95,7 @@ mod tests {
         writeln!(f, r#"{{"_id":"d2","name":"bob"}}"#).unwrap();
         index_cmd::run(&storage, "test", Some(ndjson.to_str().unwrap())).unwrap();
 
-        run(&storage, "test", OutputFormat::Json).unwrap();
+        run(&storage, "test", OutputFormat::Json, None).unwrap();
 
         let index = Index::open_in_dir(storage.tantivy_dir("test")).unwrap();
         let reader = index.reader().unwrap();
@@ -94,7 +107,7 @@ mod tests {
     fn test_stats_nonexistent_index() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path().to_str().unwrap());
-        let result = run(&storage, "nope", OutputFormat::Json);
+        let result = run(&storage, "nope", OutputFormat::Json, None);
         assert!(result.is_err());
     }
 }
