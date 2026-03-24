@@ -43,7 +43,14 @@ pub async fn run(storage: &Storage, name: &str) -> Result<()> {
 
     let tantivy_schema = config.schema.build_tantivy_schema();
     let index = Index::open_in_dir(storage.tantivy_dir(name))?;
-    let mut index_writer = index.writer(50_000_000)?;
+    let mut index_writer = match index.writer(50_000_000) {
+        Ok(w) => w,
+        Err(tantivy::TantivyError::LockFailure(_, _)) => {
+            eprintln!("[searchdb] Index locked by another process, skipping sync");
+            return Ok(());
+        }
+        Err(e) => return Err(SearchDbError::Tantivy(e)),
+    };
 
     let id_field = tantivy_schema
         .get_field("_id")
