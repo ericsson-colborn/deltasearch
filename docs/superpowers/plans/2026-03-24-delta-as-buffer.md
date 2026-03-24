@@ -45,6 +45,7 @@ src/
 - Modify: `src/commands/sync.rs:27,39,61`
 - Modify: `src/commands/connect_delta.rs:48`
 - Modify: `src/commands/reindex.rs:58`
+- Modify: `src/commands/new_index.rs:28`
 
 - [ ] **Step 1: Update the `IndexConfig` field in `storage.rs`**
 
@@ -77,7 +78,7 @@ In `src/commands/new_index.rs`, replace `last_indexed_version` with `index_versi
 - [ ] **Step 3: Run tests to verify backward compat**
 
 Run: `cargo test`
-Expected: All 30 tests pass (no behavior change, just field rename with alias).
+Expected: All existing tests pass (no behavior change, just field rename with alias).
 
 - [ ] **Step 4: Commit**
 
@@ -164,7 +165,7 @@ pub fn build_ephemeral_index(
     let tv_schema = app_schema.build_tantivy_schema();
     let dir = RamDirectory::create();
     let index = Index::create(dir, tv_schema.clone())?;
-    let mut writer = index.writer(15_000_000)?;
+    let mut writer = index.writer(3_000_000)?; // Small heap — gap is <5K rows by design
 
     let id_field = tv_schema
         .get_field("_id")
@@ -200,7 +201,7 @@ git add src/searcher.rs && git commit -m "feat: build_ephemeral_index for in-mem
 **Files:**
 - Modify: `src/searcher.rs`
 
-Add `search_with_gap()` — searches both the persistent index and an ephemeral gap index, deduplicates by `_id` (gap wins), merges by score.
+Add `search_with_gap()` — searches both the persistent index and an ephemeral gap index, deduplicates by `_id` (gap wins). Gap hits appear first (newer data), then persistent hits sorted by score. Cross-index BM25 score comparison is not meaningful (different corpus statistics), so we don't merge by score across tiers.
 
 - [ ] **Step 1: Write failing test for `search_with_gap`**
 
@@ -278,7 +279,9 @@ Add to `src/searcher.rs`:
 /// Two-tier search: persistent index + ephemeral gap index, dedup by _id.
 ///
 /// Gap rows win over persistent index rows for the same _id (newer data).
-/// Results are merged by score (descending) and paginated.
+/// Gap hits appear first (newer), then persistent hits by score.
+/// NOTE: BM25 scores are not comparable across indexes (different corpus stats),
+/// so we don't merge by score across tiers.
 #[allow(clippy::too_many_arguments)]
 pub fn search_with_gap(
     persistent_index: &Index,
@@ -297,8 +300,10 @@ pub fn search_with_gap(
     // 1. Build ephemeral index from gap rows
     let gap_index = build_ephemeral_index(app_schema, gap_rows)?;
 
-    // 2. Search the gap index (collect all — gap is small)
-    let gap_hits = search(&gap_index, app_schema, query_str, usize::MAX, 0, fields, include_score)?;
+    // 2. Search the gap index (collect all — gap is small by design)
+    let gap_hits = search(
+        &gap_index, app_schema, query_str, gap_rows.len(), 0, fields, include_score,
+    )?;
 
     // 3. Collect gap _ids for dedup
     let gap_ids: std::collections::HashSet<String> = gap_hits
@@ -322,10 +327,9 @@ pub fn search_with_gap(
         })
         .collect();
 
-    // 5. Merge by score (descending), apply offset/limit
+    // 5. Gap hits first (newer data), then persistent hits (by score), paginate
     let mut merged = gap_hits;
     merged.extend(filtered_persistent);
-    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     let paginated: Vec<SearchHit> = merged.into_iter().skip(offset).take(limit).collect();
 
@@ -512,7 +516,10 @@ async fn read_gap(storage: &Storage, name: &str) -> (Vec<serde_json::Value>, i64
     let delta = crate::delta::DeltaSync::new(source);
     let current_version = match delta.current_version().await {
         Ok(v) => v,
-        Err(_) => return (vec![], 0),
+        Err(e) => {
+            eprintln!("[searchdb] Delta read warning: {e}");
+            return (vec![], 0);
+        }
     };
     let index_version = config.index_version.unwrap_or(-1);
 
@@ -521,7 +528,13 @@ async fn read_gap(storage: &Storage, name: &str) -> (Vec<serde_json::Value>, i64
     }
 
     let gap_versions = current_version - index_version;
-    let rows = delta.rows_added_since(index_version).await.unwrap_or_default();
+    let rows = match delta.rows_added_since(index_version).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[searchdb] Delta gap read warning: {e}");
+            return (vec![], gap_versions);
+        }
+    };
     (rows, gap_versions)
 }
 ```
@@ -645,38 +658,40 @@ git add -A && git commit -m "feat: wire up two-tier search with Delta gap readin
 
 - [ ] **Step 1: Add gap info to stats output**
 
-The stats command should report `index_version` and, when a Delta source is configured, the current Delta HEAD version and gap size. Since Delta access is async, add an optional `gap_info` parameter:
+The stats command should report `index_version` and, when a Delta source is configured, the current Delta HEAD version and gap size. Pass gap info as an `Option<(i64, i64)>` tuple `(delta_version, gap_versions)` to avoid cross-module struct dependencies.
 
-In `main.rs`, before calling `stats::run`, read the Delta version if a source is configured:
+In `main.rs`, before calling `stats::run`, read the gap info:
 
 ```rust
+// In run_cli() (delta-enabled):
 Commands::Stats { name } => {
     let gap_info = read_gap_info(&storage, &name).await;
     commands::stats::run(&storage, &name, fmt, gap_info)
 }
+
+// In run_cli_sync() (non-delta):
+Commands::Stats { name } => commands::stats::run(&storage, &name, fmt, None),
 ```
 
-Add a small helper struct and function:
+Add a helper in `main.rs`:
 
 ```rust
+/// Read Delta version info for stats display.
 #[cfg(feature = "delta")]
-pub struct GapInfo {
-    pub delta_version: i64,
-    pub gap_versions: i64,
-}
-
-#[cfg(feature = "delta")]
-async fn read_gap_info(storage: &Storage, name: &str) -> Option<GapInfo> {
+async fn read_gap_info(storage: &Storage, name: &str) -> Option<(i64, i64)> {
     let config = storage.load_config(name).ok()?;
     let source = config.delta_source.as_deref()?;
     let delta = crate::delta::DeltaSync::new(source);
     let delta_version = delta.current_version().await.ok()?;
     let index_version = config.index_version.unwrap_or(-1);
-    Some(GapInfo {
-        delta_version,
-        gap_versions: delta_version - index_version,
-    })
+    Some((delta_version, delta_version - index_version))
 }
+```
+
+Update `stats::run` signature to accept `gap_info: Option<(i64, i64)>`:
+
+```rust
+pub fn run(storage: &Storage, name: &str, fmt: OutputFormat, gap_info: Option<(i64, i64)>) -> Result<()> {
 ```
 
 Update stats JSON output to include:
@@ -705,9 +720,21 @@ Fields:
   notes: Text
 ```
 
+**Note:** The stats JSON output field changes from `last_indexed_version` to `index_version`. This is a breaking change to the CLI output contract, aligned with the Task 1 field rename.
+
 - [ ] **Step 2: Update stats tests**
 
-Update test signatures to pass `None` for `gap_info` (no Delta in unit tests).
+Update all test calls to pass `None` for `gap_info`:
+
+```rust
+run(&storage, "test", OutputFormat::Json, None).unwrap();
+```
+
+Update the error test similarly:
+
+```rust
+let result = run(&storage, "nope", OutputFormat::Json, None);
+```
 
 - [ ] **Step 3: Run tests**
 
@@ -747,7 +774,7 @@ async fn test_two_tier_search_with_delta_gap() {
     let storage = crate::storage::Storage::new(index_str);
     crate::commands::connect_delta::run(
         &storage, "test", delta_str,
-        r#"{"fields":{"_id":"keyword","name":"keyword","value":"numeric"}}"#,
+        r#"{"fields":{"name":"keyword","value":"numeric"}}"#,
     ).await.unwrap();
 
     // Verify initial search works
