@@ -286,4 +286,66 @@ mod tests {
         let rows_head = sync.full_load(None).await.unwrap();
         assert_eq!(rows_head.len(), 2);
     }
+
+    #[tokio::test]
+    async fn test_two_tier_search_with_delta_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let delta_path = dir.path().join("delta_table");
+        let delta_str = delta_path.to_str().unwrap();
+        let index_dir = dir.path().join("index_data");
+        let index_str = index_dir.to_str().unwrap();
+
+        // Create Delta table with initial data
+        create_delta_table(delta_str, &[("d1", "glucose", 100.0)]).await;
+
+        // Connect — full load into tantivy index
+        let storage = crate::storage::Storage::new(index_str);
+        crate::commands::connect_delta::run(
+            &storage,
+            "test",
+            delta_str,
+            r#"{"fields":{"name":"keyword","value":"numeric"}}"#,
+        )
+        .await
+        .unwrap();
+
+        // Verify initial search works
+        let config = storage.load_config("test").unwrap();
+        let index = tantivy::Index::open_in_dir(storage.tantivy_dir("test")).unwrap();
+        let results = crate::searcher::search_with_gap(
+            &index,
+            &config.schema,
+            "+__present__:__all__",
+            10,
+            0,
+            None,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Add more rows to Delta (creates a gap)
+        append_to_delta(delta_str, &[("d2", "a1c", 5.7)]).await;
+
+        // Read gap rows
+        let sync = DeltaSync::new(delta_str);
+        let index_version = config.index_version.unwrap_or(-1);
+        let gap_rows = sync.rows_added_since(index_version).await.unwrap();
+        assert!(!gap_rows.is_empty());
+
+        // Two-tier search should find both docs
+        let results = crate::searcher::search_with_gap(
+            &index,
+            &config.schema,
+            "+__present__:__all__",
+            10,
+            0,
+            None,
+            false,
+            &gap_rows,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+    }
 }
