@@ -45,10 +45,19 @@ thiserror = "2"
 # Time
 chrono = "0.4"
 
+# TTY detection for output format
+atty = "0.2"
+
+# UUID generation for doc IDs
+uuid = { version = "1", features = ["v4"] }
+
 [features]
 default = ["delta"]
 delta = ["dep:deltalake", "dep:arrow", "dep:parquet", "dep:tokio"]
 serve = ["dep:axum", "dep:tokio"]
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 lto = true

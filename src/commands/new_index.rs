@@ -25,7 +25,7 @@ pub fn run(storage: &Storage, name: &str, schema_json: &str, overwrite: bool) ->
     let config = IndexConfig {
         schema,
         delta_source: None,
-        last_indexed_version: None,
+        index_version: None,
     };
     storage.save_config(name, &config)?;
 

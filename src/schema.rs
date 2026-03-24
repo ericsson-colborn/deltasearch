@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use tantivy::schema::{
-    DateOptions, NumericOptions, SchemaBuilder, TextFieldIndexing, TextOptions, STORED,
-};
-use tantivy::tokenizer::TextAnalyzer;
+use tantivy::schema::{DateOptions, NumericOptions, SchemaBuilder, TextFieldIndexing, TextOptions};
 
 /// SearchDB field types — maps to ES-like concepts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

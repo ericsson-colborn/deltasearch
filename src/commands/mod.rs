@@ -1,1 +1,12 @@
+#[cfg(feature = "delta")]
+pub mod connect_delta;
+pub mod drop;
+pub mod get;
+pub mod index;
 pub mod new_index;
+#[cfg(feature = "delta")]
+pub mod reindex;
+pub mod search;
+pub mod stats;
+#[cfg(feature = "delta")]
+pub mod sync;

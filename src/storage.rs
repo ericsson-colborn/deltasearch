@@ -2,7 +2,7 @@ use crate::error::{Result, SearchDbError};
 use crate::schema::Schema;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Persisted index configuration — schema + optional Delta metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,8 +10,11 @@ pub struct IndexConfig {
     pub schema: Schema,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta_source: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_indexed_version: Option<i64>,
+    #[serde(
+        alias = "last_indexed_version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub index_version: Option<i64>,
 }
 
 /// Manages the on-disk layout for SearchDB indexes.
@@ -78,6 +81,7 @@ impl Storage {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn list_indexes(&self) -> Result<Vec<String>> {
         if !self.data_dir.exists() {
             return Ok(vec![]);

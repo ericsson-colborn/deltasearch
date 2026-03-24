@@ -19,6 +19,9 @@ pub enum SearchDbError {
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("Delta Lake error: {0}")]
+    Delta(String),
 }
 
 pub type Result<T> = std::result::Result<T, SearchDbError>;
