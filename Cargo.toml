@@ -1,0 +1,56 @@
+[package]
+name = "searchdb"
+version = "0.1.0"
+edition = "2021"
+description = "ES in your pocket — embedded search backed by tantivy + Delta Lake"
+license = "Apache-2.0"
+repository = "https://github.com/ericssoncolborn/searchdb"
+
+[[bin]]
+name = "searchdb"
+path = "src/main.rs"
+
+[dependencies]
+# Search engine
+tantivy = "0.25"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Delta Lake
+deltalake = { version = "0.25", features = ["datafusion"], optional = true }
+
+# Arrow / Parquet (for reading Delta files)
+arrow = { version = "54", optional = true }
+parquet = { version = "54", optional = true }
+
+# Async runtime (delta-rs is async)
+tokio = { version = "1", features = ["full"], optional = true }
+
+# HTTP serve
+axum = { version = "0.8", optional = true }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Time
+chrono = "0.4"
+
+[features]
+default = ["delta"]
+delta = ["dep:deltalake", "dep:arrow", "dep:parquet", "dep:tokio"]
+serve = ["dep:axum", "dep:tokio"]
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
