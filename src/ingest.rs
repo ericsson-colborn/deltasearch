@@ -170,8 +170,34 @@ fn read_csv_file(path: &str, batch_size: usize) -> Result<Vec<RecordBatch>> {
     Ok(batches)
 }
 
-fn read_parquet_file(_path: &str) -> Result<Vec<RecordBatch>> {
-    todo!("Parquet reader — Task 6")
+/// Read a Parquet file into RecordBatches.
+///
+/// Direct passthrough: Parquet is already in columnar Arrow format.
+fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = File::open(path).map_err(SearchDbError::Io)?;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| SearchDbError::Schema(format!("Invalid Parquet file '{path}': {e}")))?;
+    let reader = builder
+        .build()
+        .map_err(|e| SearchDbError::Schema(format!("Failed to build Parquet reader: {e}")))?;
+
+    let mut batches = Vec::new();
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| SearchDbError::Schema(format!("Error reading Parquet batch: {e}")))?;
+        batches.push(batch);
+    }
+
+    if batches.is_empty() {
+        return Err(SearchDbError::Schema(
+            "Parquet file has no row groups".into(),
+        ));
+    }
+
+    Ok(batches)
 }
 
 #[cfg(test)]
@@ -236,6 +262,41 @@ mod tests {
     #[test]
     fn test_parse_format_invalid() {
         assert!(parse_format("xml").is_err());
+    }
+
+    #[test]
+    fn test_read_parquet_file() {
+        use arrow::array::{Float64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.parquet");
+
+        // Create a small Parquet file
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["glucose", "a1c"])),
+                Arc::new(Float64Array::from(vec![95.0, 6.1])),
+            ],
+        )
+        .unwrap();
+
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Now read it back
+        let batches = read_file(path.to_str().unwrap(), InputFormat::Parquet, 1024).unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
     }
 
     #[test]
