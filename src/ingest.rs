@@ -259,6 +259,44 @@ pub async fn write_delta(
     Ok(table.version())
 }
 
+/// Expand a source path (possibly a glob pattern) into a sorted list of file paths.
+///
+/// If the path contains glob metacharacters (* ? [ ]), expands the pattern.
+/// If it's a plain path to an existing file, returns that single file.
+/// Returns an error if no files match.
+pub fn expand_source(source: &str) -> Result<Vec<String>> {
+    let has_glob = source.contains('*')
+        || source.contains('?')
+        || source.contains('[')
+        || source.contains(']');
+
+    if has_glob {
+        let entries: Vec<String> = glob::glob(source)
+            .map_err(|e| SearchDbError::Schema(format!("Invalid glob pattern '{source}': {e}")))?
+            .filter_map(|entry| entry.ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        if entries.is_empty() {
+            return Err(SearchDbError::Schema(format!(
+                "No files match pattern '{source}'"
+            )));
+        }
+
+        let mut sorted = entries;
+        sorted.sort();
+        Ok(sorted)
+    } else {
+        // Single file path
+        if !std::path::Path::new(source).exists() {
+            return Err(SearchDbError::Schema(format!(
+                "Source file not found: '{source}'"
+            )));
+        }
+        Ok(vec![source.to_string()])
+    }
+}
+
 /// Read data from a generic reader (stdin, pipe, etc.) into RecordBatches.
 ///
 /// Parquet is not supported from non-seekable sources.
@@ -558,6 +596,37 @@ mod tests {
     fn test_read_parquet_from_reader_errors() {
         let cursor = std::io::Cursor::new(b"not parquet data");
         let result = read_from_reader(cursor, InputFormat::Parquet, 1024);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_expand_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("b.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("c.csv"), "x").unwrap();
+
+        let pattern = format!("{}/*.json", dir.path().to_str().unwrap());
+        let files = expand_source(&pattern).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|f| f.ends_with(".json")));
+    }
+
+    #[test]
+    fn test_expand_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.ndjson");
+        std::fs::write(&path, "{}").unwrap();
+
+        let files = expand_source(path.to_str().unwrap()).unwrap();
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn test_expand_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let pattern = format!("{}/*.xyz", dir.path().to_str().unwrap());
+        let result = expand_source(&pattern);
         assert!(result.is_err());
     }
 
