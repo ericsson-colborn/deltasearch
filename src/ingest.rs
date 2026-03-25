@@ -200,6 +200,80 @@ fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>> {
     Ok(batches)
 }
 
+/// Read data from a generic reader (stdin, pipe, etc.) into RecordBatches.
+///
+/// Parquet is not supported from non-seekable sources.
+pub fn read_from_reader(
+    reader: impl Read,
+    format: InputFormat,
+    batch_size: usize,
+) -> Result<Vec<RecordBatch>> {
+    match format {
+        InputFormat::Ndjson => read_ndjson_reader(BufReader::new(reader), batch_size),
+        InputFormat::Json => {
+            let mut content = String::new();
+            BufReader::new(reader)
+                .read_to_string(&mut content)
+                .map_err(SearchDbError::Io)?;
+            let parsed: serde_json::Value = serde_json::from_str(&content)?;
+            let objects = match parsed {
+                serde_json::Value::Array(arr) => arr,
+                serde_json::Value::Object(_) => vec![parsed],
+                _ => {
+                    return Err(SearchDbError::Schema(
+                        "JSON input must be an array of objects or a single object".into(),
+                    ))
+                }
+            };
+            if objects.is_empty() {
+                return Err(SearchDbError::Schema("JSON array is empty".into()));
+            }
+            let ndjson: String = objects
+                .iter()
+                .map(|obj| serde_json::to_string(obj).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n");
+            read_ndjson_reader(BufReader::new(std::io::Cursor::new(ndjson)), batch_size)
+        }
+        InputFormat::Csv => read_csv_from_reader(reader, batch_size),
+        InputFormat::Parquet => Err(SearchDbError::Schema(
+            "Parquet format requires a seekable file source. Use --source with a file path."
+                .into(),
+        )),
+    }
+}
+
+/// Read CSV from a reader with schema inference.
+fn read_csv_from_reader(reader: impl Read, batch_size: usize) -> Result<Vec<RecordBatch>> {
+    // Read all content into memory so we can infer schema then parse
+    let mut content = Vec::new();
+    BufReader::new(reader)
+        .read_to_end(&mut content)
+        .map_err(SearchDbError::Io)?;
+
+    let format = arrow_csv::reader::Format::default().with_header(true);
+    let (schema, _) = format
+        .infer_schema(std::io::Cursor::new(&content), None)
+        .map_err(|e| SearchDbError::Schema(format!("Failed to infer CSV schema: {e}")))?;
+
+    let csv_reader = arrow_csv::ReaderBuilder::new(std::sync::Arc::new(schema))
+        .with_header(true)
+        .with_batch_size(batch_size)
+        .build(std::io::Cursor::new(content))
+        .map_err(|e| SearchDbError::Schema(format!("Failed to build CSV reader: {e}")))?;
+
+    let mut batches = Vec::new();
+    for batch_result in csv_reader {
+        let batch = batch_result
+            .map_err(|e| SearchDbError::Schema(format!("Error reading CSV: {e}")))?;
+        batches.push(batch);
+    }
+    if batches.is_empty() {
+        return Err(SearchDbError::Schema("CSV input has no data rows".into()));
+    }
+    Ok(batches)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +473,32 @@ mod tests {
         let batches = read_file(path.to_str().unwrap(), InputFormat::Ndjson, 1024).unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
+    }
+
+    #[test]
+    fn test_read_ndjson_from_reader() {
+        let data = r#"{"name":"glucose","value":95.0}
+{"name":"a1c","value":6.1}
+"#;
+        let cursor = std::io::Cursor::new(data);
+        let batches = read_from_reader(cursor, InputFormat::Ndjson, 1024).unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[test]
+    fn test_read_csv_from_reader() {
+        let data = "name,value\nglucose,95.0\na1c,6.1\n";
+        let cursor = std::io::Cursor::new(data);
+        let batches = read_from_reader(cursor, InputFormat::Csv, 1024).unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[test]
+    fn test_read_parquet_from_reader_errors() {
+        let cursor = std::io::Cursor::new(b"not parquet data");
+        let result = read_from_reader(cursor, InputFormat::Parquet, 1024);
+        assert!(result.is_err());
     }
 }
