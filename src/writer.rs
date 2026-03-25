@@ -107,6 +107,21 @@ pub fn upsert_document(writer: &IndexWriter, id_field: Field, doc: TantivyDocume
         .expect("add_document should not fail");
 }
 
+/// Delete documents by their `_id` values.
+///
+/// Issues a `delete_term` for each ID. Deletions take effect on the next commit.
+/// Returns the number of delete operations issued (actual doc removals depend
+/// on whether matching docs exist in the index).
+pub fn delete_documents(writer: &IndexWriter, id_field: Field, ids: &[String]) -> usize {
+    let mut count = 0;
+    for id in ids {
+        let term = Term::from_field_text(id_field, id);
+        writer.delete_term(term);
+        count += 1;
+    }
+    count
+}
+
 /// Parse an ISO 8601 date string into a tantivy DateTime.
 fn parse_date(s: &str) -> Result<TantivyDateTime> {
     // Normalize "Z" suffix to "+00:00" for chrono parsing
