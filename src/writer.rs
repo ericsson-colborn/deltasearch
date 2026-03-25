@@ -19,6 +19,45 @@ pub fn make_doc_id(doc: &serde_json::Value) -> String {
         .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
+/// Add a single typed value to a tantivy document field.
+///
+/// Dispatches on the field type: text for keyword/text, f64 for numeric, date for date.
+fn add_typed_value(
+    tdoc: &mut TantivyDocument,
+    field: tantivy::schema::Field,
+    field_name: &str,
+    field_type: &FieldType,
+    value: &serde_json::Value,
+) -> Result<()> {
+    match field_type {
+        FieldType::Keyword | FieldType::Text => {
+            let text = match value {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            tdoc.add_text(field, &text);
+        }
+        FieldType::Numeric => {
+            let num = value.as_f64().ok_or_else(|| {
+                SearchDbError::Schema(format!(
+                    "field '{field_name}' expected numeric, got {value}"
+                ))
+            })?;
+            tdoc.add_f64(field, num);
+        }
+        FieldType::Date => {
+            let date_str = value.as_str().ok_or_else(|| {
+                SearchDbError::Schema(format!(
+                    "field '{field_name}' expected date string, got {value}"
+                ))
+            })?;
+            let parsed = parse_date(date_str)?;
+            tdoc.add_date(field, parsed);
+        }
+    }
+    Ok(())
+}
+
 /// Build a tantivy `TantivyDocument` from a JSON object.
 ///
 /// Populates:
@@ -64,34 +103,20 @@ pub fn build_document(
             SearchDbError::Schema(format!("field '{field_name}' not in tantivy schema"))
         })?;
 
-        match field_type {
-            FieldType::Keyword | FieldType::Text => {
-                let text = match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                tdoc.add_text(field, &text);
+        // Collect values: arrays produce multiple values, scalars produce one
+        let values: Vec<&serde_json::Value> = match value {
+            serde_json::Value::Array(arr) => arr.iter().collect(),
+            scalar => vec![scalar],
+        };
+
+        for val in &values {
+            if val.is_null() {
+                continue;
             }
-            FieldType::Numeric => {
-                let num = value.as_f64().ok_or_else(|| {
-                    SearchDbError::Schema(format!(
-                        "field '{field_name}' expected numeric, got {value}"
-                    ))
-                })?;
-                tdoc.add_f64(field, num);
-            }
-            FieldType::Date => {
-                let date_str = value.as_str().ok_or_else(|| {
-                    SearchDbError::Schema(format!(
-                        "field '{field_name}' expected date string, got {value}"
-                    ))
-                })?;
-                let parsed = parse_date(date_str)?;
-                tdoc.add_date(field, parsed);
-            }
+            add_typed_value(&mut tdoc, field, field_name, field_type, val)?;
         }
 
-        // Track non-null field in __present__
+        // Track non-null field in __present__ (once, not per element)
         tdoc.add_text(present_field, field_name);
     }
 
@@ -288,5 +313,150 @@ mod tests {
         let field = tv_schema.get_field("active").unwrap();
         let values: Vec<&str> = doc.get_all(field).flat_map(|v| v.as_str()).collect();
         assert_eq!(values, vec!["true"]);
+    }
+
+    #[test]
+    fn test_build_document_keyword_array() {
+        let schema = Schema {
+            fields: BTreeMap::from([("tags".into(), FieldType::Keyword)]),
+        };
+        let tv_schema = schema.build_tantivy_schema();
+
+        let doc_json = serde_json::json!({"_id": "d1", "tags": ["urgent", "lab", "review"]});
+        let doc = build_document(&tv_schema, &schema, &doc_json, "d1").unwrap();
+
+        let field = tv_schema.get_field("tags").unwrap();
+        let values: Vec<&str> = doc.get_all(field).flat_map(|v| v.as_str()).collect();
+        assert_eq!(values, vec!["urgent", "lab", "review"]);
+    }
+
+    #[test]
+    fn test_build_document_numeric_array() {
+        let schema = Schema {
+            fields: BTreeMap::from([("scores".into(), FieldType::Numeric)]),
+        };
+        let tv_schema = schema.build_tantivy_schema();
+
+        let doc_json = serde_json::json!({"_id": "d1", "scores": [90.0, 85.5, 92.0]});
+        let doc = build_document(&tv_schema, &schema, &doc_json, "d1").unwrap();
+
+        let field = tv_schema.get_field("scores").unwrap();
+        let values: Vec<f64> = doc.get_all(field).flat_map(|v| v.as_f64()).collect();
+        assert_eq!(values, vec![90.0, 85.5, 92.0]);
+    }
+
+    #[test]
+    fn test_build_document_date_array() {
+        let schema = Schema {
+            fields: BTreeMap::from([("dates".into(), FieldType::Date)]),
+        };
+        let tv_schema = schema.build_tantivy_schema();
+
+        let doc_json = serde_json::json!({
+            "_id": "d1",
+            "dates": ["2024-01-15T10:00:00Z", "2024-02-20T14:00:00Z"]
+        });
+        let doc = build_document(&tv_schema, &schema, &doc_json, "d1").unwrap();
+
+        let field = tv_schema.get_field("dates").unwrap();
+        let values: Vec<_> = doc.get_all(field).collect();
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn test_build_document_array_with_nulls() {
+        let schema = Schema {
+            fields: BTreeMap::from([("tags".into(), FieldType::Keyword)]),
+        };
+        let tv_schema = schema.build_tantivy_schema();
+
+        let doc_json = serde_json::json!({"_id": "d1", "tags": [null, "urgent", null, "lab"]});
+        let doc = build_document(&tv_schema, &schema, &doc_json, "d1").unwrap();
+
+        let field = tv_schema.get_field("tags").unwrap();
+        let values: Vec<&str> = doc.get_all(field).flat_map(|v| v.as_str()).collect();
+        assert_eq!(values, vec!["urgent", "lab"]);
+    }
+
+    #[test]
+    fn test_build_document_array_present_added_once() {
+        let schema = Schema {
+            fields: BTreeMap::from([("tags".into(), FieldType::Keyword)]),
+        };
+        let tv_schema = schema.build_tantivy_schema();
+
+        let doc_json = serde_json::json!({"_id": "d1", "tags": ["a", "b", "c"]});
+        let doc = build_document(&tv_schema, &schema, &doc_json, "d1").unwrap();
+
+        let present_field = tv_schema.get_field("__present__").unwrap();
+        let present_values: Vec<&str> = doc
+            .get_all(present_field)
+            .flat_map(|v| v.as_str())
+            .collect();
+        // "tags" should appear exactly once in __present__
+        let tag_count = present_values.iter().filter(|&&v| v == "tags").count();
+        assert_eq!(tag_count, 1);
+        assert!(present_values.contains(&"__all__"));
+    }
+
+    #[test]
+    fn test_build_document_array_source_preserves_array() {
+        let schema = Schema {
+            fields: BTreeMap::from([("tags".into(), FieldType::Keyword)]),
+        };
+        let tv_schema = schema.build_tantivy_schema();
+
+        let doc_json = serde_json::json!({"_id": "d1", "tags": ["urgent", "lab"]});
+        let doc = build_document(&tv_schema, &schema, &doc_json, "d1").unwrap();
+
+        let source_field = tv_schema.get_field("_source").unwrap();
+        let source = doc.get_first(source_field).unwrap().as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(source).unwrap();
+        assert_eq!(parsed["tags"], serde_json::json!(["urgent", "lab"]));
+    }
+
+    #[test]
+    fn test_array_field_searchable() {
+        let schema = Schema {
+            fields: BTreeMap::from([("tags".into(), FieldType::Keyword)]),
+        };
+        let tv_schema = schema.build_tantivy_schema();
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = tantivy::Index::create_in_dir(dir.path(), tv_schema.clone()).unwrap();
+        let mut writer = index.writer(50_000_000).unwrap();
+        let id_field = tv_schema.get_field("_id").unwrap();
+
+        let doc_json = serde_json::json!({"_id": "d1", "tags": ["urgent", "lab"]});
+        let doc = build_document(&tv_schema, &schema, &doc_json, "d1").unwrap();
+        upsert_document(&writer, id_field, doc, "d1");
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+
+        let tags_field = tv_schema.get_field("tags").unwrap();
+        let parser = tantivy::query::QueryParser::for_index(&index, vec![tags_field]);
+
+        // Search for "urgent" — should find the doc
+        let query = parser.parse_query(r#"tags:"urgent""#).unwrap();
+        let results = searcher
+            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Search for "lab" — should also find the doc
+        let query = parser.parse_query(r#"tags:"lab""#).unwrap();
+        let results = searcher
+            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Search for "nonexistent" — should not find the doc
+        let query = parser.parse_query(r#"tags:"nonexistent""#).unwrap();
+        let results = searcher
+            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+            .unwrap();
+        assert_eq!(results.len(), 0);
     }
 }

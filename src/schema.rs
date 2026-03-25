@@ -107,7 +107,9 @@ impl Schema {
 
 /// Infer a FieldType from a single JSON value.
 ///
-/// Returns None for null, arrays, and objects (not indexable in v1).
+/// Returns None for null and objects (not indexable).
+/// Arrays of homogeneous primitives are supported: the element type is inferred.
+/// Mixed-type arrays, nested arrays, and empty arrays return None.
 /// Strings are checked for ISO 8601 datetime pattern before defaulting to keyword.
 /// Booleans are treated as keywords ("true"/"false").
 pub fn infer_field_type(value: &serde_json::Value) -> Option<FieldType> {
@@ -122,8 +124,58 @@ pub fn infer_field_type(value: &serde_json::Value) -> Option<FieldType> {
                 Some(FieldType::Keyword)
             }
         }
-        serde_json::Value::Array(_) => None,
+        serde_json::Value::Array(arr) => infer_array_element_type(arr),
         serde_json::Value::Object(_) => None,
+    }
+}
+
+/// Infer the element type of a JSON array.
+///
+/// Returns the FieldType if the array contains homogeneous primitives (skipping nulls).
+/// Returns None for empty arrays, mixed-type arrays, or arrays containing nested
+/// arrays/objects.
+fn infer_array_element_type(arr: &[serde_json::Value]) -> Option<FieldType> {
+    // Find the first non-null element to determine the base type
+    let first_type = arr.iter().find_map(|v| match v {
+        serde_json::Value::Null => None,
+        other => Some(other),
+    })?;
+
+    let base_type = match first_type {
+        serde_json::Value::Bool(_) => FieldType::Keyword,
+        serde_json::Value::Number(_) => FieldType::Numeric,
+        serde_json::Value::String(s) => {
+            if looks_like_date(s) {
+                FieldType::Date
+            } else {
+                FieldType::Keyword
+            }
+        }
+        // Nested arrays and objects are not supported
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => return None,
+        serde_json::Value::Null => unreachable!(),
+    };
+
+    // Verify all non-null elements are the same type
+    let all_match = arr.iter().all(|v| match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::Bool(_) => matches!(base_type, FieldType::Keyword),
+        serde_json::Value::Number(_) => matches!(base_type, FieldType::Numeric),
+        serde_json::Value::String(s) => {
+            if looks_like_date(s) {
+                matches!(base_type, FieldType::Date)
+            } else {
+                matches!(base_type, FieldType::Keyword)
+            }
+        }
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => false,
+    });
+
+    if all_match {
+        Some(base_type)
+    } else {
+        log::warn!("mixed-type array skipped during inference");
+        None
     }
 }
 
@@ -133,7 +185,9 @@ const INTERNAL_FIELDS: &[&str] = &["_id", "_source", "__present__"];
 /// Infer a Schema from a batch of JSON documents.
 ///
 /// Scans all documents and collects the first non-null type for each field.
-/// Skips internal fields (_id, _source, __present__), arrays, and objects.
+/// Arrays of homogeneous primitives are supported as multi-valued fields.
+/// Skips internal fields (_id, _source, __present__), objects, mixed arrays,
+/// and empty arrays.
 pub fn infer_schema(docs: &[serde_json::Value]) -> Schema {
     let mut fields = BTreeMap::new();
     for doc in docs {
@@ -182,7 +236,8 @@ pub fn merge_schemas_with_diff(base: &Schema, discovered: &Schema) -> (Schema, V
 }
 
 /// Map an Arrow DataType to a SearchDB FieldType.
-/// Returns None for complex types (List, Struct, Map, etc.).
+/// Returns None for complex types (Struct, Map, etc.).
+/// List types are supported: `List(Utf8)` → Keyword, `List(Float64)` → Numeric, etc.
 #[cfg(feature = "delta")]
 fn arrow_type_to_field_type(dt: &arrow::datatypes::DataType) -> Option<FieldType> {
     use arrow::datatypes::DataType;
@@ -201,6 +256,10 @@ fn arrow_type_to_field_type(dt: &arrow::datatypes::DataType) -> Option<FieldType
         | DataType::Float32
         | DataType::Float64 => Some(FieldType::Numeric),
         DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64 => Some(FieldType::Date),
+        // List types: infer from the element type (multi-valued fields)
+        DataType::List(inner) | DataType::LargeList(inner) => {
+            arrow_type_to_field_type(inner.data_type())
+        }
         _ => None,
     }
 }
@@ -285,8 +344,58 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_field_type_array() {
-        assert_eq!(infer_field_type(&serde_json::json!([1, 2, 3])), None);
+    fn test_infer_field_type_array_of_numbers() {
+        assert_eq!(
+            infer_field_type(&serde_json::json!([1, 2, 3])),
+            Some(FieldType::Numeric)
+        );
+    }
+
+    #[test]
+    fn test_infer_field_type_array_of_strings() {
+        assert_eq!(
+            infer_field_type(&serde_json::json!(["a", "b", "c"])),
+            Some(FieldType::Keyword)
+        );
+    }
+
+    #[test]
+    fn test_infer_field_type_array_mixed() {
+        assert_eq!(infer_field_type(&serde_json::json!([1, "two", 3])), None);
+    }
+
+    #[test]
+    fn test_infer_field_type_array_empty() {
+        assert_eq!(infer_field_type(&serde_json::json!([])), None);
+    }
+
+    #[test]
+    fn test_infer_field_type_array_nested() {
+        assert_eq!(infer_field_type(&serde_json::json!([[1, 2], [3, 4]])), None);
+    }
+
+    #[test]
+    fn test_infer_field_type_array_with_nulls() {
+        assert_eq!(
+            infer_field_type(&serde_json::json!([null, "a", null, "b"])),
+            Some(FieldType::Keyword)
+        );
+    }
+
+    #[test]
+    fn test_infer_field_type_array_all_nulls() {
+        assert_eq!(infer_field_type(&serde_json::json!([null, null])), None);
+    }
+
+    #[test]
+    fn test_infer_field_type_array_of_dates() {
+        assert_eq!(
+            infer_field_type(&serde_json::json!([
+                "2024-01-15T10:30:00Z",
+                "2024-02-20T14:00:00Z"
+            ])),
+            Some(FieldType::Date)
+        );
     }
 
     #[test]
@@ -327,12 +436,30 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_schema_skips_nested_and_arrays() {
+    fn test_infer_schema_skips_nested_but_handles_arrays() {
         let docs =
             vec![serde_json::json!({"name": "alice", "tags": ["a", "b"], "addr": {"city": "NYC"}})];
         let schema = infer_schema(&docs);
-        assert_eq!(schema.fields.len(), 1);
+        assert_eq!(schema.fields.len(), 2);
         assert!(schema.fields.contains_key("name"));
+        assert_eq!(schema.fields["tags"], FieldType::Keyword);
+        // Nested objects still skipped
+        assert!(!schema.fields.contains_key("addr"));
+    }
+
+    #[test]
+    fn test_infer_schema_array_of_numbers() {
+        let docs = vec![serde_json::json!({"name": "alice", "scores": [90, 85, 92]})];
+        let schema = infer_schema(&docs);
+        assert_eq!(schema.fields["scores"], FieldType::Numeric);
+    }
+
+    #[test]
+    fn test_infer_schema_skips_mixed_arrays() {
+        let docs = vec![serde_json::json!({"name": "alice", "data": [1, "two", 3]})];
+        let schema = infer_schema(&docs);
+        assert_eq!(schema.fields.len(), 1); // only "name"
+        assert!(!schema.fields.contains_key("data"));
     }
 
     #[test]
@@ -427,7 +554,7 @@ mod tests {
 
     #[cfg(feature = "delta")]
     #[test]
-    fn test_from_arrow_fields_skips_complex_types() {
+    fn test_from_arrow_fields_handles_list_types() {
         use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use std::sync::Arc;
 
@@ -439,6 +566,11 @@ mod tests {
                 true,
             ),
             ArrowField::new(
+                "scores",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Float64, true))),
+                true,
+            ),
+            ArrowField::new(
                 "meta",
                 DataType::Struct(Vec::<ArrowField>::new().into()),
                 true,
@@ -446,8 +578,12 @@ mod tests {
         ]);
 
         let schema = from_arrow_schema(&arrow_schema);
-        assert_eq!(schema.fields.len(), 1);
-        assert!(schema.fields.contains_key("name"));
+        assert_eq!(schema.fields.len(), 3);
+        assert_eq!(schema.fields["name"], FieldType::Keyword);
+        assert_eq!(schema.fields["tags"], FieldType::Keyword);
+        assert_eq!(schema.fields["scores"], FieldType::Numeric);
+        // Struct still skipped
+        assert!(!schema.fields.contains_key("meta"));
     }
 
     #[test]
