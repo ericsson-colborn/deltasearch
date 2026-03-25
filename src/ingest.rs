@@ -104,8 +104,39 @@ fn read_ndjson_reader(reader: impl BufRead, batch_size: usize) -> Result<Vec<Rec
     Ok(batches)
 }
 
-fn read_json_file(_path: &str, _batch_size: usize) -> Result<Vec<RecordBatch>> {
-    todo!("JSON array reader — Task 4")
+/// Read a JSON file (array of objects or single object) into RecordBatches.
+///
+/// Parses the entire file as JSON, extracts individual objects,
+/// converts each to an NDJSON line, and feeds through the NDJSON reader.
+fn read_json_file(path: &str, batch_size: usize) -> Result<Vec<RecordBatch>> {
+    let content = std::fs::read_to_string(path).map_err(SearchDbError::Io)?;
+    let parsed: serde_json::Value = serde_json::from_str(&content)?;
+
+    let objects = match parsed {
+        serde_json::Value::Array(arr) => arr,
+        serde_json::Value::Object(_) => vec![parsed],
+        _ => {
+            return Err(SearchDbError::Schema(
+                "JSON file must contain an array of objects or a single object".into(),
+            ))
+        }
+    };
+
+    if objects.is_empty() {
+        return Err(SearchDbError::Schema("JSON array is empty".into()));
+    }
+
+    // Convert to NDJSON lines and feed through NDJSON reader
+    let ndjson: String = objects
+        .iter()
+        .map(|obj| serde_json::to_string(obj).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    read_ndjson_reader(
+        BufReader::new(std::io::Cursor::new(ndjson)),
+        batch_size,
+    )
 }
 
 fn read_csv_file(_path: &str, _batch_size: usize) -> Result<Vec<RecordBatch>> {
@@ -201,6 +232,36 @@ mod tests {
         let schema = batches[0].schema();
         assert!(schema.field_with_name("name").is_ok());
         assert!(schema.field_with_name("value").is_ok());
+    }
+
+    #[test]
+    fn test_read_json_array_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.json");
+        std::fs::write(
+            &path,
+            r#"[
+                {"name": "glucose", "value": 95.0},
+                {"name": "a1c", "value": 6.1}
+            ]"#,
+        )
+        .unwrap();
+
+        let batches = read_file(path.to_str().unwrap(), InputFormat::Json, 1024).unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[test]
+    fn test_read_json_single_object_wraps() {
+        // A single JSON object (not in array) should also work
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.json");
+        std::fs::write(&path, r#"{"name": "glucose", "value": 95.0}"#).unwrap();
+
+        let batches = read_file(path.to_str().unwrap(), InputFormat::Json, 1024).unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1);
     }
 
     #[test]
