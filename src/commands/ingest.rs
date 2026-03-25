@@ -1,5 +1,5 @@
 use crate::error::{Result, SearchDbError};
-use crate::ingest::{self, InputFormat, WriteMode};
+use crate::ingest::{self, WriteMode};
 use arrow::record_batch::RecordBatch;
 
 /// Run the ingest command: read source files and write to a Delta table.
@@ -68,14 +68,9 @@ fn read_from_source(
 }
 
 /// Read from stdin (requires --format).
-fn read_from_stdin(
-    format_override: Option<&str>,
-    batch_size: usize,
-) -> Result<Vec<RecordBatch>> {
+fn read_from_stdin(format_override: Option<&str>, batch_size: usize) -> Result<Vec<RecordBatch>> {
     let format_str = format_override.ok_or_else(|| {
-        SearchDbError::Schema(
-            "Reading from stdin requires --format (cannot auto-detect)".into(),
-        )
+        SearchDbError::Schema("Reading from stdin requires --format (cannot auto-detect)".into())
     })?;
     let format = ingest::parse_format(format_str)?;
 

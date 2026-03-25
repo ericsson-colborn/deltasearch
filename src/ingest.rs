@@ -82,7 +82,7 @@ fn read_ndjson_reader(reader: impl BufRead, batch_size: usize) -> Result<Vec<Rec
     // Collect non-empty lines
     let lines: Vec<String> = reader
         .lines()
-        .filter_map(|l| l.ok())
+        .map_while(|l| l.ok())
         .filter(|l| !l.trim().is_empty())
         .collect();
 
@@ -144,10 +144,7 @@ fn read_json_file(path: &str, batch_size: usize) -> Result<Vec<RecordBatch>> {
         .collect::<Vec<_>>()
         .join("\n");
 
-    read_ndjson_reader(
-        BufReader::new(std::io::Cursor::new(ndjson)),
-        batch_size,
-    )
+    read_ndjson_reader(BufReader::new(std::io::Cursor::new(ndjson)), batch_size)
 }
 
 /// Read a CSV file (with header row) into RecordBatches.
@@ -245,9 +242,7 @@ pub async fn write_delta(
             DeltaOps::try_from_uri(delta_uri)
                 .await
                 .map_err(|e| {
-                    SearchDbError::Delta(format!(
-                        "Cannot access Delta URI '{delta_uri}': {e}"
-                    ))
+                    SearchDbError::Delta(format!("Cannot access Delta URI '{delta_uri}': {e}"))
                 })?
                 .write(batches)
                 .with_save_mode(save_mode)
@@ -334,8 +329,7 @@ pub fn read_from_reader(
         }
         InputFormat::Csv => read_csv_from_reader(reader, batch_size),
         InputFormat::Parquet => Err(SearchDbError::Schema(
-            "Parquet format requires a seekable file source. Use --source with a file path."
-                .into(),
+            "Parquet format requires a seekable file source. Use --source with a file path.".into(),
         )),
     }
 }
@@ -361,8 +355,8 @@ fn read_csv_from_reader(reader: impl Read, batch_size: usize) -> Result<Vec<Reco
 
     let mut batches = Vec::new();
     for batch_result in csv_reader {
-        let batch = batch_result
-            .map_err(|e| SearchDbError::Schema(format!("Error reading CSV: {e}")))?;
+        let batch =
+            batch_result.map_err(|e| SearchDbError::Schema(format!("Error reading CSV: {e}")))?;
         batches.push(batch);
     }
     if batches.is_empty() {
@@ -415,10 +409,7 @@ mod tests {
             detect_format("/tmp/data/file.ndjson"),
             Some(InputFormat::Ndjson)
         );
-        assert_eq!(
-            detect_format("./relative/path.csv"),
-            Some(InputFormat::Csv)
-        );
+        assert_eq!(detect_format("./relative/path.csv"), Some(InputFormat::Csv));
     }
 
     #[test]
@@ -728,8 +719,7 @@ mod tests {
         // Ingest to Delta
         let delta_path = dir.path().join("delta_out");
         let delta_str = delta_path.to_str().unwrap();
-        let batches =
-            read_file(source_path.to_str().unwrap(), InputFormat::Ndjson, 1024).unwrap();
+        let batches = read_file(source_path.to_str().unwrap(), InputFormat::Ndjson, 1024).unwrap();
         let version = write_delta(delta_str, batches, WriteMode::Overwrite)
             .await
             .unwrap();

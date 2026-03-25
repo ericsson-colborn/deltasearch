@@ -332,8 +332,14 @@ async fn run_cli() {
             mode,
             batch_size,
         } => {
-            commands::ingest::run(source.as_deref(), &delta, format.as_deref(), &mode, batch_size)
-                .await
+            commands::ingest::run(
+                source.as_deref(),
+                &delta,
+                format.as_deref(),
+                &mode,
+                batch_size,
+            )
+            .await
         }
     };
 
