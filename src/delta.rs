@@ -5,17 +5,30 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::error::{Result, SearchDbError};
 
+/// Changes between two Delta table versions: added rows and removed file URIs.
+///
+/// Used by incremental sync to handle both inserts and deletes.
+/// - `added_rows`: rows from newly added Parquet files (to upsert)
+/// - `removed_ids`: `_id` values from removed Parquet files (to delete)
+#[derive(Debug, Default)]
+pub struct DeltaChanges {
+    pub added_rows: Vec<serde_json::Value>,
+    pub removed_ids: Vec<String>,
+}
+
 /// Wraps a Delta table and provides load helpers for SearchDB.
 ///
 /// Sync strategy:
 /// - Full load: read all Parquet files from the table
 /// - Incremental: diff file URIs between last_version and HEAD,
-///   read only new Parquet files, upsert their rows
+///   read only new Parquet files, upsert their rows. Detect removed
+///   files and extract `_id` values for deletion.
 ///
 /// Limitations:
-/// - No delete support — use `reindex` to rebuild when deletes matter
 /// - File-level diffing: rewritten files (OPTIMIZE) are re-read, but
 ///   upsert by _id handles deduplication
+/// - If removed files have been vacuumed, a warning is logged and
+///   `dsrch reindex` is recommended
 pub struct DeltaSync {
     source: String,
 }
@@ -104,6 +117,153 @@ impl DeltaSync {
 
         read_parquet_files_to_json(&added)
     }
+
+    /// Return changes between last_version and HEAD: added rows AND removed IDs.
+    ///
+    /// Detects both new Parquet files (added rows) and removed Parquet files
+    /// (deleted rows). For removed files, attempts to read them and extract
+    /// `_id` values for deletion from the index. If a removed file has been
+    /// vacuumed (physically deleted), logs a warning — `dsrch reindex` is the
+    /// fallback for that edge case.
+    ///
+    /// If last_version < 0 (never synced), treats all rows as added.
+    pub async fn changes_since(&self, last_version: i64) -> Result<DeltaChanges> {
+        if last_version < 0 {
+            let rows = self.full_load(None).await?;
+            return Ok(DeltaChanges {
+                added_rows: rows,
+                removed_ids: vec![],
+            });
+        }
+
+        let current = self.open(None).await?;
+        let current_files: HashSet<String> = current
+            .get_file_uris()
+            .map_err(|e| SearchDbError::Delta(format!("failed to get file URIs: {e}")))?
+            .collect();
+
+        let prev = match self.open(Some(last_version)).await {
+            Ok(t) => t,
+            Err(_) => {
+                log::warn!(
+                    "Cannot open Delta v{last_version} (vacuumed?), falling back to full reload"
+                );
+                let rows = self.full_load(None).await?;
+                return Ok(DeltaChanges {
+                    added_rows: rows,
+                    removed_ids: vec![],
+                });
+            }
+        };
+        let prev_files: HashSet<String> = prev
+            .get_file_uris()
+            .map_err(|e| SearchDbError::Delta(format!("failed to get file URIs: {e}")))?
+            .collect();
+
+        // Added files: in current but not in prev
+        let added: Vec<&String> = current_files.difference(&prev_files).collect();
+        let added_rows = if added.is_empty() {
+            vec![]
+        } else {
+            read_parquet_files_to_json(&added)?
+        };
+
+        // Removed files: in prev but not in current
+        let removed: Vec<&String> = prev_files.difference(&current_files).collect();
+        let removed_ids = if removed.is_empty() {
+            vec![]
+        } else {
+            extract_ids_from_parquet_files(&removed)
+        };
+
+        Ok(DeltaChanges {
+            added_rows,
+            removed_ids,
+        })
+    }
+}
+
+/// Extract `_id` values from Parquet files (for deletion after file removal).
+///
+/// Reads only the `_id` column from each file. If a file cannot be opened
+/// (e.g., vacuumed), logs a warning and skips it — callers should recommend
+/// `dsrch reindex` when this happens.
+fn extract_ids_from_parquet_files(uris: &[impl AsRef<str>]) -> Vec<String> {
+    use arrow::array::{Array, AsArray};
+
+    let mut ids = Vec::new();
+    let mut unreadable = 0usize;
+
+    for uri in uris {
+        let path = strip_file_uri(uri.as_ref());
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                unreadable += 1;
+                log::warn!("Cannot read removed file '{path}' (vacuumed?), skipping");
+                continue;
+            }
+        };
+
+        let builder = match ParquetRecordBatchReaderBuilder::try_new(file) {
+            Ok(b) => b,
+            Err(e) => {
+                unreadable += 1;
+                log::warn!("Invalid Parquet file '{path}': {e}");
+                continue;
+            }
+        };
+
+        let reader = match builder.build() {
+            Ok(r) => r,
+            Err(e) => {
+                unreadable += 1;
+                log::warn!("Failed to build Parquet reader for '{path}': {e}");
+                continue;
+            }
+        };
+
+        for batch_result in reader {
+            let batch = match batch_result {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!("Error reading batch from '{path}': {e}");
+                    continue;
+                }
+            };
+
+            // Look for the _id column
+            let schema = batch.schema();
+            let idx = match schema.index_of("_id") {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+
+            let col = batch.column(idx);
+            if let Some(string_array) = col.as_string_opt::<i32>() {
+                for i in 0..string_array.len() {
+                    if !string_array.is_null(i) {
+                        ids.push(string_array.value(i).to_string());
+                    }
+                }
+            } else if let Some(string_array) = col.as_string_opt::<i64>() {
+                for i in 0..string_array.len() {
+                    if !string_array.is_null(i) {
+                        ids.push(string_array.value(i).to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if unreadable > 0 {
+        eprintln!(
+            "[dsrch] WARNING: {unreadable} removed file(s) could not be read (vacuumed?). \
+             Run 'dsrch reindex' for a full rebuild."
+        );
+    }
+
+    ids
 }
 
 /// Read Parquet files and convert rows to JSON values.
@@ -300,6 +460,140 @@ mod tests {
         // Full load at HEAD should have 2
         let rows_head = sync.full_load(None).await.unwrap();
         assert_eq!(rows_head.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_changes_since_append_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let delta_path = dir.path().join("delta_table");
+        let delta_str = delta_path.to_str().unwrap();
+
+        create_delta_table(delta_str, &[("d1", "glucose", 100.0)]).await;
+
+        let sync = DeltaSync::new(delta_str);
+        let v1 = sync.current_version().await.unwrap();
+
+        append_to_delta(delta_str, &[("d2", "a1c", 5.7)]).await;
+
+        let changes = sync.changes_since(v1).await.unwrap();
+        assert!(!changes.added_rows.is_empty(), "should have added rows");
+        assert!(
+            changes.removed_ids.is_empty(),
+            "append-only should have no removed IDs"
+        );
+
+        let has_d2 = changes
+            .added_rows
+            .iter()
+            .any(|r| r.get("_id").and_then(|v| v.as_str()) == Some("d2"));
+        assert!(has_d2, "added rows should include d2");
+    }
+
+    #[tokio::test]
+    async fn test_changes_since_no_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let delta_path = dir.path().join("delta_table");
+        let delta_str = delta_path.to_str().unwrap();
+
+        create_delta_table(delta_str, &[("d1", "glucose", 100.0)]).await;
+
+        let sync = DeltaSync::new(delta_str);
+        let v = sync.current_version().await.unwrap();
+
+        let changes = sync.changes_since(v).await.unwrap();
+        assert!(changes.added_rows.is_empty());
+        assert!(changes.removed_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_changes_since_never_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        let delta_path = dir.path().join("delta_table");
+        let delta_str = delta_path.to_str().unwrap();
+
+        create_delta_table(delta_str, &[("d1", "glucose", 100.0), ("d2", "a1c", 5.7)]).await;
+
+        let sync = DeltaSync::new(delta_str);
+        // last_version < 0 means never synced — should return all rows as added
+        let changes = sync.changes_since(-1).await.unwrap();
+        assert_eq!(changes.added_rows.len(), 2);
+        assert!(changes.removed_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_changes_since_overwrite_detects_removed_ids() {
+        use deltalake::protocol::SaveMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let delta_path = dir.path().join("delta_table");
+        let delta_str = delta_path.to_str().unwrap();
+
+        // Create table with d1 and d2
+        create_delta_table(delta_str, &[("d1", "glucose", 100.0), ("d2", "a1c", 5.7)]).await;
+
+        let sync = DeltaSync::new(delta_str);
+        let v1 = sync.current_version().await.unwrap();
+
+        // Overwrite with only d2 (removes d1)
+        let batch = make_batch(&[("d2", "a1c", 5.7)]);
+        let table = deltalake::open_table(delta_str).await.unwrap();
+        DeltaOps(table)
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Overwrite)
+            .await
+            .unwrap();
+
+        let changes = sync.changes_since(v1).await.unwrap();
+
+        // The overwrite creates a new file (added) and removes the old file(s)
+        // The removed file should have d1 and d2 as IDs
+        let removed_has_d1 = changes.removed_ids.iter().any(|id| id == "d1");
+        assert!(
+            removed_has_d1,
+            "removed_ids should include d1, got: {:?}",
+            changes.removed_ids
+        );
+
+        // Added rows should have d2 (from the new file)
+        let added_has_d2 = changes
+            .added_rows
+            .iter()
+            .any(|r| r.get("_id").and_then(|v| v.as_str()) == Some("d2"));
+        assert!(added_has_d2, "added rows should include d2");
+    }
+
+    #[tokio::test]
+    async fn test_changes_since_delete_detects_removed_ids() {
+        use deltalake::datafusion::prelude::{col, lit};
+
+        let dir = tempfile::tempdir().unwrap();
+        let delta_path = dir.path().join("delta_table");
+        let delta_str = delta_path.to_str().unwrap();
+
+        // Create table with d1 and d2
+        create_delta_table(delta_str, &[("d1", "glucose", 100.0), ("d2", "a1c", 5.7)]).await;
+
+        let sync = DeltaSync::new(delta_str);
+        let v1 = sync.current_version().await.unwrap();
+
+        // Delete d1 using Delta delete operation
+        let table = deltalake::open_table(delta_str).await.unwrap();
+        DeltaOps(table)
+            .delete()
+            .with_predicate(col("_id").eq(lit("d1")))
+            .await
+            .unwrap();
+
+        let changes = sync.changes_since(v1).await.unwrap();
+
+        // After delete, the original file is removed and a new file with only d2 is added.
+        // The removed file had both d1 and d2.
+        let removed_has_d1 = changes.removed_ids.iter().any(|id| id == "d1");
+        assert!(
+            removed_has_d1,
+            "removed_ids should include d1, got: {:?}",
+            changes.removed_ids
+        );
     }
 
     #[tokio::test]

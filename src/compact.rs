@@ -142,7 +142,7 @@ impl<'a> CompactWorker<'a> {
     }
 
     /// Level 1: Poll Delta for new rows and create segments.
-    /// Returns true if any rows were indexed.
+    /// Returns true if any rows were indexed or deleted.
     async fn poll_and_segment(
         &self,
         delta: &DeltaSync,
@@ -166,42 +166,57 @@ impl<'a> CompactWorker<'a> {
              index={index_version}, gap={gap} versions"
         );
 
-        let rows = delta.rows_added_since(index_version).await?;
+        let changes = delta.changes_since(index_version).await?;
 
-        if rows.is_empty() {
-            eprintln!("[dsrch] compact: no new rows to index");
+        if changes.added_rows.is_empty() && changes.removed_ids.is_empty() {
+            eprintln!("[dsrch] compact: no changes to process");
             current_config.index_version = Some(current_version);
             self.save_config_with_compact(&current_config)?;
             return Ok(false);
         }
 
-        eprintln!(
-            "[dsrch] compact: read {} rows from Delta v{}..v{}",
-            rows.len(),
-            index_version,
-            current_version
-        );
-
-        // Split into batches of segment_size
-        let batches: Vec<&[serde_json::Value]> = rows.chunks(self.opts.segment_size).collect();
-        let num_batches = batches.len();
-
-        for (i, batch) in batches.into_iter().enumerate() {
-            for row in batch {
-                let doc_id = writer::make_doc_id(row);
-                let doc =
-                    writer::build_document(tantivy_schema, &initial_config.schema, row, &doc_id)?;
-                writer::upsert_document(index_writer, id_field, doc, &doc_id);
-            }
-
+        // Process deletions first (before upserts, so re-added rows win)
+        if !changes.removed_ids.is_empty() {
+            let del_count = writer::delete_documents(index_writer, id_field, &changes.removed_ids);
             index_writer.commit()?;
+            eprintln!("[dsrch] compact: deleted {del_count} document(s) from removed Delta files");
+        }
 
+        // Process added rows
+        let rows = &changes.added_rows;
+        if !rows.is_empty() {
             eprintln!(
-                "[dsrch] compact: committed segment {}/{} ({} docs)",
-                i + 1,
-                num_batches,
-                batch.len()
+                "[dsrch] compact: read {} rows from Delta v{}..v{}",
+                rows.len(),
+                index_version,
+                current_version
             );
+
+            // Split into batches of segment_size
+            let batches: Vec<&[serde_json::Value]> = rows.chunks(self.opts.segment_size).collect();
+            let num_batches = batches.len();
+
+            for (i, batch) in batches.into_iter().enumerate() {
+                for row in batch {
+                    let doc_id = writer::make_doc_id(row);
+                    let doc = writer::build_document(
+                        tantivy_schema,
+                        &initial_config.schema,
+                        row,
+                        &doc_id,
+                    )?;
+                    writer::upsert_document(index_writer, id_field, doc, &doc_id);
+                }
+
+                index_writer.commit()?;
+
+                eprintln!(
+                    "[dsrch] compact: committed segment {}/{} ({} docs)",
+                    i + 1,
+                    num_batches,
+                    batch.len()
+                );
+            }
         }
 
         // Update watermark AFTER all segments committed (crash safety)
@@ -728,6 +743,147 @@ mod tests {
         assert!(
             result.unwrap().is_ok(),
             "worker should exit cleanly on shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_handles_delta_deletes() {
+        use deltalake::datafusion::prelude::{col, lit};
+
+        let dir = tempfile::tempdir().unwrap();
+        let delta_path = dir.path().join("delta_table");
+        let delta_str = delta_path.to_str().unwrap();
+        let data_dir = dir.path().join("dsrch_data");
+        let data_str = data_dir.to_str().unwrap();
+
+        // Create Delta table with 3 rows
+        create_delta_table(
+            delta_str,
+            &[
+                ("d1", "glucose", 100.0),
+                ("d2", "a1c", 5.7),
+                ("d3", "creatinine", 1.2),
+            ],
+        )
+        .await;
+
+        // Connect and initial load
+        let storage = crate::storage::Storage::new(data_str);
+        crate::commands::connect_delta::run(
+            &storage,
+            "lab",
+            delta_str,
+            Some(r#"{"fields":{"name":"keyword","value":"numeric"}}"#),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Verify all 3 docs are indexed
+        let index = tantivy::Index::open_in_dir(storage.tantivy_dir("lab")).unwrap();
+        let reader = index.reader().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 3);
+
+        // Delete d1 from Delta
+        let table = deltalake::open_table(delta_str).await.unwrap();
+        DeltaOps(table)
+            .delete()
+            .with_predicate(col("_id").eq(lit("d1")))
+            .await
+            .unwrap();
+
+        // Run compact --once to pick up the delete
+        let opts = CompactOptions {
+            once: true,
+            ..CompactOptions::default()
+        };
+        let worker = CompactWorker::new(&storage, "lab", opts);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        worker.run(rx).await.unwrap();
+
+        // Force merge to consolidate segments and surface actual doc count
+        let opts = CompactOptions {
+            force_merge: true,
+            ..CompactOptions::default()
+        };
+        let worker = CompactWorker::new(&storage, "lab", opts);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        worker.run(rx).await.unwrap();
+
+        // Verify d1 is gone — only d2 and d3 remain
+        let index = tantivy::Index::open_in_dir(storage.tantivy_dir("lab")).unwrap();
+        let reader = index.reader().unwrap();
+        assert_eq!(
+            reader.searcher().num_docs(),
+            2,
+            "d1 should be deleted, leaving 2 docs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_handles_overwrite_deletes() {
+        use deltalake::protocol::SaveMode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let delta_path = dir.path().join("delta_table");
+        let delta_str = delta_path.to_str().unwrap();
+        let data_dir = dir.path().join("dsrch_data");
+        let data_str = data_dir.to_str().unwrap();
+
+        // Create Delta table with 2 rows
+        create_delta_table(delta_str, &[("d1", "glucose", 100.0), ("d2", "a1c", 5.7)]).await;
+
+        // Connect and initial load
+        let storage = crate::storage::Storage::new(data_str);
+        crate::commands::connect_delta::run(
+            &storage,
+            "lab",
+            delta_str,
+            Some(r#"{"fields":{"name":"keyword","value":"numeric"}}"#),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Verify 2 docs indexed
+        let index = tantivy::Index::open_in_dir(storage.tantivy_dir("lab")).unwrap();
+        let reader = index.reader().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 2);
+
+        // Overwrite Delta with only d2 (d1 is removed)
+        let batch = make_batch(&[("d2", "a1c", 5.7)]);
+        let table = deltalake::open_table(delta_str).await.unwrap();
+        DeltaOps(table)
+            .write(vec![batch])
+            .with_save_mode(SaveMode::Overwrite)
+            .await
+            .unwrap();
+
+        // Run compact --once
+        let opts = CompactOptions {
+            once: true,
+            ..CompactOptions::default()
+        };
+        let worker = CompactWorker::new(&storage, "lab", opts);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        worker.run(rx).await.unwrap();
+
+        // Force merge
+        let opts = CompactOptions {
+            force_merge: true,
+            ..CompactOptions::default()
+        };
+        let worker = CompactWorker::new(&storage, "lab", opts);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        worker.run(rx).await.unwrap();
+
+        // Verify d1 is removed — only d2 remains
+        let index = tantivy::Index::open_in_dir(storage.tantivy_dir("lab")).unwrap();
+        let reader = index.reader().unwrap();
+        assert_eq!(
+            reader.searcher().num_docs(),
+            1,
+            "d1 should be deleted via overwrite, leaving 1 doc"
         );
     }
 }
