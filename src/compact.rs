@@ -628,4 +628,49 @@ mod tests {
             "error should mention writer lock: {err_msg}"
         );
     }
+
+    #[tokio::test]
+    async fn test_compact_shutdown_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let delta_path = dir.path().join("delta_table");
+        let delta_str = delta_path.to_str().unwrap();
+        let data_dir = dir.path().join("searchdb_data");
+        let data_str = data_dir.to_str().unwrap();
+
+        create_delta_table(delta_str, &[("d1", "glucose", 100.0)]).await;
+
+        let storage = crate::storage::Storage::new(data_str);
+        crate::commands::connect_delta::run(
+            &storage,
+            "lab",
+            delta_str,
+            r#"{"fields":{"name":"keyword","value":"numeric"}}"#,
+        )
+        .await
+        .unwrap();
+
+        // Run compact in continuous mode but immediately signal shutdown
+        let opts = CompactOptions {
+            poll_interval_secs: 1,
+            ..CompactOptions::default()
+        };
+        let worker = CompactWorker::new(&storage, "lab", opts);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        // Send shutdown signal immediately
+        tx.send(true).unwrap();
+
+        // Worker should exit quickly after seeing the signal
+        let result =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), worker.run(rx)).await;
+
+        assert!(
+            result.is_ok(),
+            "worker should exit within 5 seconds of shutdown signal"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "worker should exit cleanly on shutdown"
+        );
+    }
 }
