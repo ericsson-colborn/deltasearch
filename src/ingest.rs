@@ -1,4 +1,6 @@
 use arrow::record_batch::RecordBatch;
+use deltalake::protocol::SaveMode;
+use deltalake::DeltaOps;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 
@@ -15,6 +17,15 @@ pub enum InputFormat {
     Csv,
     /// Apache Parquet (columnar)
     Parquet,
+}
+
+/// Write mode for Delta table output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    /// Replace existing table data (or create new).
+    Overwrite,
+    /// Append to existing table.
+    Append,
 }
 
 /// Detect input format from file extension.
@@ -198,6 +209,54 @@ fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>> {
     }
 
     Ok(batches)
+}
+
+/// Write RecordBatches to a Delta Lake table.
+///
+/// For `WriteMode::Overwrite`: creates a new table or replaces all data.
+/// For `WriteMode::Append`: adds rows to an existing table.
+///
+/// Returns the Delta table version after the write.
+pub async fn write_delta(
+    delta_uri: &str,
+    batches: Vec<RecordBatch>,
+    mode: WriteMode,
+) -> Result<i64> {
+    if batches.is_empty() {
+        return Err(SearchDbError::Schema(
+            "No data to write to Delta table".into(),
+        ));
+    }
+
+    let save_mode = match mode {
+        WriteMode::Overwrite => SaveMode::Overwrite,
+        WriteMode::Append => SaveMode::Append,
+    };
+
+    // Try to open existing table; if it fails, create via write
+    let table = match deltalake::open_table(delta_uri).await {
+        Ok(t) => DeltaOps(t)
+            .write(batches)
+            .with_save_mode(save_mode)
+            .await
+            .map_err(|e| SearchDbError::Delta(format!("Delta write failed: {e}")))?,
+        Err(_) => {
+            // Table doesn't exist yet — create it via write
+            DeltaOps::try_from_uri(delta_uri)
+                .await
+                .map_err(|e| {
+                    SearchDbError::Delta(format!(
+                        "Cannot access Delta URI '{delta_uri}': {e}"
+                    ))
+                })?
+                .write(batches)
+                .with_save_mode(save_mode)
+                .await
+                .map_err(|e| SearchDbError::Delta(format!("Delta write failed: {e}")))?
+        }
+    };
+
+    Ok(table.version())
 }
 
 /// Read data from a generic reader (stdin, pipe, etc.) into RecordBatches.
@@ -500,5 +559,85 @@ mod tests {
         let cursor = std::io::Cursor::new(b"not parquet data");
         let result = read_from_reader(cursor, InputFormat::Parquet, 1024);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_delta_new_table() {
+        use arrow::array::{Float64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let delta_path = dir.path().join("delta_out");
+        let delta_str = delta_path.to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["glucose", "a1c"])),
+                Arc::new(Float64Array::from(vec![95.0, 6.1])),
+            ],
+        )
+        .unwrap();
+
+        let version = write_delta(delta_str, vec![batch], WriteMode::Overwrite)
+            .await
+            .unwrap();
+        assert!(version >= 0);
+
+        // Verify the Delta table was created and has data
+        let table = deltalake::open_table(delta_str).await.unwrap();
+        assert!(table.version() >= 0);
+    }
+
+    #[tokio::test]
+    async fn test_write_delta_append() {
+        use arrow::array::{Float64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let delta_path = dir.path().join("delta_out");
+        let delta_str = delta_path.to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+
+        // First write
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["glucose"])),
+                Arc::new(Float64Array::from(vec![95.0])),
+            ],
+        )
+        .unwrap();
+        write_delta(delta_str, vec![batch1], WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // Append
+        let batch2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a1c"])),
+                Arc::new(Float64Array::from(vec![6.1])),
+            ],
+        )
+        .unwrap();
+        write_delta(delta_str, vec![batch2], WriteMode::Append)
+            .await
+            .unwrap();
+
+        // Read back via DeltaSync
+        let sync = crate::delta::DeltaSync::new(delta_str);
+        let rows = sync.full_load(None).await.unwrap();
+        assert_eq!(rows.len(), 2);
     }
 }
