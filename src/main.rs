@@ -5,6 +5,8 @@ mod compact;
 mod delta;
 mod error;
 mod es_dsl;
+#[cfg(feature = "delta")]
+mod ingest;
 mod merge_policy;
 mod schema;
 mod searcher;
@@ -194,6 +196,26 @@ enum Commands {
         #[arg(long)]
         once: bool,
     },
+
+    /// Ingest raw files (NDJSON, JSON, CSV, Parquet) into a Delta Lake table
+    #[cfg(feature = "delta")]
+    Ingest {
+        /// Source file(s) — glob pattern or single path (omit for stdin)
+        #[arg(long)]
+        source: Option<String>,
+        /// Delta Lake table destination (path or URI)
+        #[arg(long)]
+        delta: String,
+        /// File format: ndjson, json, csv, parquet (auto-detected from extension)
+        #[arg(long)]
+        format: Option<String>,
+        /// Write mode: overwrite (default) or append
+        #[arg(long, default_value = "overwrite")]
+        mode: String,
+        /// Rows per read batch
+        #[arg(long, default_value_t = 10_000)]
+        batch_size: usize,
+    },
 }
 
 #[cfg(feature = "delta")]
@@ -303,6 +325,22 @@ async fn run_cli() {
                 once,
             };
             commands::compact::run(&storage, &name, opts).await
+        }
+        Commands::Ingest {
+            source,
+            delta,
+            format,
+            mode,
+            batch_size,
+        } => {
+            commands::ingest::run(
+                source.as_deref(),
+                &delta,
+                format.as_deref(),
+                &mode,
+                batch_size,
+            )
+            .await
         }
     };
 

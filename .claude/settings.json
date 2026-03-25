@@ -30,5 +30,8 @@
       "WebFetch(domain:api.github.com)"
     ]
   },
-  "plansDirectory": "docs/plans"
+  "plansDirectory": "docs/plans",
+  "enabledPlugins": {
+    "rust-skills@rust-skills": true
+  }
 }

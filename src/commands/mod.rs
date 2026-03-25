@@ -5,6 +5,8 @@ pub mod connect_delta;
 pub mod drop;
 pub mod get;
 pub mod index;
+#[cfg(feature = "delta")]
+pub mod ingest;
 pub mod new_index;
 #[cfg(feature = "delta")]
 pub mod reindex;
