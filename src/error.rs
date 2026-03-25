@@ -24,7 +24,6 @@ pub enum SearchDbError {
     Delta(String),
 
     #[error("Another writer is already running for index '{0}'. Only one compact worker can run per index.")]
-    #[allow(dead_code)]
     WriterLocked(String),
 }
 

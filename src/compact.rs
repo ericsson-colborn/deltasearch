@@ -11,12 +11,13 @@ use crate::writer;
 
 /// Configuration for the compact worker, populated from CLI flags.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct CompactOptions {
     pub segment_size: usize,
     pub merge_interval_secs: u64,
     pub max_segments: usize,
     pub poll_interval_secs: u64,
+    /// Not yet used — reserved for time-pressure commit feature.
+    #[allow(dead_code)]
     pub max_segment_age_secs: u64,
     pub force_merge: bool,
     pub once: bool,
@@ -37,14 +38,12 @@ impl Default for CompactOptions {
 }
 
 /// The compact worker: polls Delta, creates segments (L1), merges them (L2).
-#[allow(dead_code)]
 pub struct CompactWorker<'a> {
     storage: &'a Storage,
     name: String,
     opts: CompactOptions,
 }
 
-#[allow(dead_code)]
 impl<'a> CompactWorker<'a> {
     pub fn new(storage: &'a Storage, name: &str, opts: CompactOptions) -> Self {
         Self {
