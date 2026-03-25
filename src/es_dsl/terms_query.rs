@@ -79,7 +79,6 @@ impl TermsQuery {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::es_dsl::ElasticQueryDsl;
     use crate::schema::{FieldType, Schema};
     use std::collections::BTreeMap;

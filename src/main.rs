@@ -4,7 +4,6 @@ mod compact;
 #[cfg(feature = "delta")]
 mod delta;
 mod error;
-#[allow(dead_code)] // Wired into search command in a later task
 mod es_dsl;
 mod schema;
 mod searcher;
@@ -81,13 +80,16 @@ enum Commands {
         file: Option<String>,
     },
 
-    /// Search an index with a query string
+    /// Search an index with a query string or ES DSL
     Search {
         /// Index name
         name: String,
         /// Tantivy query string (Lucene-like syntax)
-        #[arg(short, long)]
-        query: String,
+        #[arg(short, long, conflicts_with = "dsl")]
+        query: Option<String>,
+        /// Elasticsearch query DSL (JSON string, @file, or - for stdin)
+        #[arg(long, conflicts_with = "query")]
+        dsl: Option<String>,
         /// Maximum number of results
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -155,7 +157,7 @@ enum Commands {
         as_of_version: Option<i64>,
     },
 
-    /// Tiered compaction worker: poll Delta, create segments, merge on schedule
+    /// Run the compaction worker (segment creation + merge)
     #[cfg(feature = "delta")]
     Compact {
         /// Index name
@@ -172,14 +174,14 @@ enum Commands {
         /// Seconds between Delta polls
         #[arg(long, default_value_t = 10)]
         poll_interval: u64,
-        /// Force commit after N seconds even if under segment_size threshold
+        /// Force commit after N seconds even if under segment_size
         #[arg(long, default_value_t = 60)]
         max_segment_age: u64,
         /// One-shot: merge all segments into one and exit
-        #[arg(long, default_value_t = false)]
+        #[arg(long)]
         force_merge: bool,
         /// One-shot: poll once, segment if needed, merge if needed, exit
-        #[arg(long, default_value_t = false)]
+        #[arg(long)]
         once: bool,
     },
 }
@@ -212,6 +214,7 @@ async fn run_cli() {
         Commands::Search {
             name,
             query,
+            dsl,
             limit,
             offset,
             fields,
@@ -219,7 +222,16 @@ async fn run_cli() {
         } => {
             let (gap_rows, gap_versions) = read_gap(&storage, &name).await;
             let result = commands::search::run(
-                &storage, &name, &query, limit, offset, fields, score, fmt, &gap_rows,
+                &storage,
+                &name,
+                query.as_deref(),
+                dsl.as_deref(),
+                limit,
+                offset,
+                fields,
+                score,
+                fmt,
+                &gap_rows,
             );
             maybe_spawn_sync(&cli.data_dir, &name, gap_versions);
             result
@@ -363,6 +375,7 @@ fn run_cli_sync() {
         Commands::Search {
             name,
             query,
+            dsl,
             limit,
             offset,
             fields,
@@ -370,7 +383,8 @@ fn run_cli_sync() {
         } => commands::search::run(
             &storage,
             &name,
-            &query,
+            query.as_deref(),
+            dsl.as_deref(),
             limit,
             offset,
             fields,

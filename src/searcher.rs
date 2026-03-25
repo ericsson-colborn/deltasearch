@@ -5,6 +5,7 @@ use tantivy::schema::Value;
 use tantivy::{Index, TantivyDocument};
 
 use crate::error::{Result, SearchDbError};
+use crate::es_dsl::ElasticQueryDsl;
 use crate::schema::Schema;
 
 /// A single search hit — parsed from _source with metadata.
@@ -13,6 +14,42 @@ use crate::schema::Schema;
 pub struct SearchHit {
     pub doc: serde_json::Value,
     pub score: f32,
+}
+
+/// Execute a pre-built tantivy query and return results.
+///
+/// Shared by both the query string path (`search()`) and the DSL path (`search_dsl()`).
+fn execute_query(
+    index: &Index,
+    query: &dyn tantivy::query::Query,
+    limit: usize,
+    offset: usize,
+    fields: Option<&[String]>,
+    include_score: bool,
+) -> Result<Vec<SearchHit>> {
+    let tv_schema = index.schema();
+    let reader = index
+        .reader()
+        .map_err(|e| SearchDbError::Schema(format!("failed to open reader: {e}")))?;
+    let searcher = reader.searcher();
+
+    let top_docs = searcher.search(query, &TopDocs::with_limit(limit + offset))?;
+
+    let source_field = tv_schema
+        .get_field("_source")
+        .map_err(|_| SearchDbError::Schema("missing _source field".into()))?;
+    let id_field = tv_schema
+        .get_field("_id")
+        .map_err(|_| SearchDbError::Schema("missing _id field".into()))?;
+
+    let mut results = Vec::new();
+    for (score, doc_address) in top_docs.into_iter().skip(offset) {
+        let doc: TantivyDocument = searcher.doc(doc_address)?;
+        let hit = doc_to_hit(&doc, source_field, id_field, score, fields, include_score)?;
+        results.push(hit);
+    }
+
+    Ok(results)
 }
 
 /// Execute a query string search against a tantivy index.
@@ -29,10 +66,6 @@ pub fn search(
     include_score: bool,
 ) -> Result<Vec<SearchHit>> {
     let tv_schema = index.schema();
-    let reader = index
-        .reader()
-        .map_err(|e| SearchDbError::Schema(format!("failed to open reader: {e}")))?;
-    let searcher = reader.searcher();
 
     // Default fields for the query parser: all user fields + _id + __present__
     let mut default_fields = vec![];
@@ -53,24 +86,109 @@ pub fn search(
         .parse_query(query_str)
         .map_err(|e| SearchDbError::Schema(format!("query parse failed: {e}")))?;
 
-    // Fetch limit+offset results, then skip the first `offset`
-    let top_docs = searcher.search(&query, &TopDocs::with_limit(limit + offset))?;
+    execute_query(index, query.as_ref(), limit, offset, fields, include_score)
+}
 
-    let source_field = tv_schema
-        .get_field("_source")
-        .map_err(|_| SearchDbError::Schema("missing _source field".into()))?;
-    let id_field = tv_schema
-        .get_field("_id")
-        .map_err(|_| SearchDbError::Schema("missing _id field".into()))?;
+/// Execute an Elasticsearch DSL query against a tantivy index.
+///
+/// Parses the JSON DSL, compiles it to a tantivy query, and executes.
+pub fn search_dsl(
+    index: &Index,
+    app_schema: &Schema,
+    dsl_json: &str,
+    limit: usize,
+    offset: usize,
+    fields: Option<&[String]>,
+    include_score: bool,
+) -> Result<Vec<SearchHit>> {
+    let tv_schema = index.schema();
 
-    let mut results = Vec::new();
-    for (score, doc_address) in top_docs.into_iter().skip(offset) {
-        let doc: TantivyDocument = searcher.doc(doc_address)?;
-        let hit = doc_to_hit(&doc, source_field, id_field, score, fields, include_score)?;
-        results.push(hit);
+    // Deserialize and compile
+    let es_query: ElasticQueryDsl = serde_json::from_str(dsl_json)
+        .map_err(|e| SearchDbError::Schema(format!("DSL parse error: {e}")))?;
+    let query = es_query.compile(&tv_schema, app_schema)?;
+
+    execute_query(index, query.as_ref(), limit, offset, fields, include_score)
+}
+
+/// Two-tier DSL search: persistent index + ephemeral gap index, dedup by _id.
+#[allow(clippy::too_many_arguments)]
+pub fn search_dsl_with_gap(
+    persistent_index: &Index,
+    app_schema: &Schema,
+    dsl_json: &str,
+    limit: usize,
+    offset: usize,
+    fields: Option<&[String]>,
+    include_score: bool,
+    gap_rows: &[serde_json::Value],
+) -> Result<Vec<SearchHit>> {
+    if gap_rows.is_empty() {
+        return search_dsl(
+            persistent_index,
+            app_schema,
+            dsl_json,
+            limit,
+            offset,
+            fields,
+            include_score,
+        );
     }
 
-    Ok(results)
+    // 1. Build ephemeral index from gap rows
+    let gap_index = build_ephemeral_index(app_schema, gap_rows)?;
+
+    // 2. Search the gap index
+    let gap_hits = search_dsl(
+        &gap_index,
+        app_schema,
+        dsl_json,
+        gap_rows.len(),
+        0,
+        fields,
+        include_score,
+    )?;
+
+    // 3. Collect gap _ids for dedup
+    let gap_ids: std::collections::HashSet<String> = gap_hits
+        .iter()
+        .filter_map(|h| {
+            h.doc
+                .get("_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    // 4. Search persistent index, excluding gap _ids
+    let persistent_hits = search_dsl(
+        persistent_index,
+        app_schema,
+        dsl_json,
+        limit + offset,
+        0,
+        fields,
+        include_score,
+    )?;
+
+    let filtered_persistent: Vec<SearchHit> = persistent_hits
+        .into_iter()
+        .filter(|h| {
+            h.doc
+                .get("_id")
+                .and_then(|v| v.as_str())
+                .map(|id| !gap_ids.contains(id))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    // 5. Gap hits first (newer data), then persistent hits, paginate
+    let mut merged = gap_hits;
+    merged.extend(filtered_persistent);
+
+    let paginated: Vec<SearchHit> = merged.into_iter().skip(offset).take(limit).collect();
+
+    Ok(paginated)
 }
 
 /// Look up a single document by `_id`.
@@ -583,5 +701,261 @@ mod tests {
 
         let doc = get_with_gap(&index, "nonexistent", &[]).unwrap();
         assert!(doc.is_none());
+    }
+
+    #[test]
+    fn test_search_dsl_term_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_test_index(dir.path());
+
+        let dsl = r#"{"term": {"name": "glucose"}}"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 2);
+        for hit in &results {
+            assert_eq!(hit.doc["name"], "glucose");
+        }
+    }
+
+    #[test]
+    fn test_search_dsl_match_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_test_index(dir.path());
+
+        let dsl = r#"{"match": {"notes": "diabetes"}}"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc["_id"], "d2");
+    }
+
+    #[test]
+    fn test_search_dsl_match_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_test_index(dir.path());
+
+        let dsl = r#"{"match_all": {}}"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_search_dsl_bool_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_test_index(dir.path());
+
+        let dsl = r#"{
+            "bool": {
+                "must": [{"term": {"name": "glucose"}}],
+                "must_not": [{"match": {"notes": "postprandial"}}]
+            }
+        }"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc["notes"], "fasting blood sample");
+    }
+
+    #[test]
+    fn test_search_dsl_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_test_index(dir.path());
+
+        let dsl = "not json";
+        let result = search_dsl(&index, &schema, dsl, 10, 0, None, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_search_dsl_with_limit_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_test_index(dir.path());
+
+        let dsl = r#"{"match_all": {}}"#;
+        let results = search_dsl(&index, &schema, dsl, 2, 0, None, false).unwrap();
+        assert_eq!(results.len(), 2);
+
+        let results = search_dsl(&index, &schema, dsl, 10, 2, None, false).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    // --- Integration-style tests with full schema (keyword, text, numeric, date) ---
+
+    fn setup_full_test_index(dir: &std::path::Path) -> (Index, Schema, tantivy::schema::Schema) {
+        let schema = Schema {
+            fields: BTreeMap::from([
+                ("name".into(), FieldType::Keyword),
+                ("notes".into(), FieldType::Text),
+                ("age".into(), FieldType::Numeric),
+                ("created_at".into(), FieldType::Date),
+            ]),
+        };
+        let tv_schema = schema.build_tantivy_schema();
+        let index = Index::create_in_dir(dir, tv_schema.clone()).unwrap();
+        let mut w = index.writer(50_000_000).unwrap();
+        let id_field = tv_schema.get_field("_id").unwrap();
+
+        let docs = vec![
+            serde_json::json!({
+                "_id": "d1", "name": "glucose", "notes": "fasting blood sample",
+                "age": 45.0, "created_at": "2024-06-15T10:00:00Z"
+            }),
+            serde_json::json!({
+                "_id": "d2", "name": "a1c", "notes": "borderline diabetic",
+                "age": 62.0, "created_at": "2024-03-20T14:30:00Z"
+            }),
+            serde_json::json!({
+                "_id": "d3", "name": "glucose", "notes": "postprandial check",
+                "age": 33.0, "created_at": "2024-09-01T08:00:00Z"
+            }),
+            serde_json::json!({
+                "_id": "d4", "name": "creatinine", "notes": "kidney function test",
+                "age": 55.0, "created_at": "2024-01-10T09:00:00Z"
+            }),
+        ];
+
+        for doc_json in &docs {
+            let doc_id = writer::make_doc_id(doc_json);
+            let doc = writer::build_document(&tv_schema, &schema, doc_json, &doc_id).unwrap();
+            writer::upsert_document(&w, id_field, doc, &doc_id);
+        }
+        w.commit().unwrap();
+
+        (index, schema, tv_schema)
+    }
+
+    #[test]
+    fn test_dsl_term_keyword_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let dsl = r#"{"term": {"name": "glucose"}}"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 2);
+        for hit in &results {
+            assert_eq!(hit.doc["name"], "glucose");
+        }
+    }
+
+    #[test]
+    fn test_dsl_terms_multi_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let dsl = r#"{"terms": {"name": ["glucose", "a1c"]}}"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_dsl_match_stemmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let dsl = r#"{"match": {"notes": "diabetes"}}"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc["_id"], "d2");
+    }
+
+    #[test]
+    fn test_dsl_match_phrase_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let dsl = r#"{"match_phrase": {"notes": "fasting blood"}}"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc["_id"], "d1");
+    }
+
+    #[test]
+    fn test_dsl_range_numeric() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let dsl = r#"{"range": {"age": {"gte": 50}}}"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_dsl_range_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let dsl = r#"{"range": {"created_at": {"gte": "2024-06-01T00:00:00Z"}}}"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_dsl_exists_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let dsl = r#"{"exists": {"field": "name"}}"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 4);
+    }
+
+    #[test]
+    fn test_dsl_bool_compound() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let dsl = r#"{
+            "bool": {
+                "must": [{"term": {"name": "glucose"}}],
+                "filter": [{"range": {"age": {"gte": 40}}}]
+            }
+        }"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc["_id"], "d1");
+    }
+
+    #[test]
+    fn test_dsl_match_all_returns_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let dsl = r#"{"match_all": {}}"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 4);
+    }
+
+    #[test]
+    fn test_dsl_match_none_returns_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let dsl = r#"{"match_none": {}}"#;
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_dsl_with_gap_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let gap_rows = vec![
+            serde_json::json!({
+                "_id": "d1", "name": "glucose", "notes": "UPDATED fasting",
+                "age": 46.0, "created_at": "2024-06-15T10:00:00Z"
+            }),
+            serde_json::json!({
+                "_id": "d5", "name": "glucose", "notes": "new doc",
+                "age": 28.0, "created_at": "2024-12-01T00:00:00Z"
+            }),
+        ];
+
+        let dsl = r#"{"term": {"name": "glucose"}}"#;
+        let results =
+            search_dsl_with_gap(&index, &schema, dsl, 10, 0, None, false, &gap_rows).unwrap();
+        // d1 (gap), d3 (index), d5 (gap) = 3 glucose docs
+        assert_eq!(results.len(), 3);
+
+        // gap d1 should have updated notes
+        let d1 = results.iter().find(|h| h.doc["_id"] == "d1").unwrap();
+        assert_eq!(d1.doc["notes"], "UPDATED fasting");
     }
 }

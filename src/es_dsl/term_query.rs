@@ -115,7 +115,6 @@ pub(super) use parse_date_to_tantivy as parse_date;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::es_dsl::ElasticQueryDsl;
     use crate::schema::{FieldType, Schema};
     use std::collections::BTreeMap;
