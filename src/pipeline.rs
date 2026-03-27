@@ -164,12 +164,9 @@ mod tests {
         let schema = test_schema();
         let tv_schema = schema.build_tantivy_schema();
         let dir = tantivy::directory::RamDirectory::create();
-        let index = tantivy::Index::create(
-            dir,
-            tv_schema.clone(),
-            tantivy::IndexSettings::default(),
-        )
-        .unwrap();
+        let index =
+            tantivy::Index::create(dir, tv_schema.clone(), tantivy::IndexSettings::default())
+                .unwrap();
         let mut writer = index.writer(15_000_000).unwrap();
 
         let rows: Vec<serde_json::Value> = (0..100)
@@ -205,12 +202,9 @@ mod tests {
         let schema = test_schema();
         let tv_schema = schema.build_tantivy_schema();
         let dir = tantivy::directory::RamDirectory::create();
-        let index = tantivy::Index::create(
-            dir,
-            tv_schema.clone(),
-            tantivy::IndexSettings::default(),
-        )
-        .unwrap();
+        let index =
+            tantivy::Index::create(dir, tv_schema.clone(), tantivy::IndexSettings::default())
+                .unwrap();
         let mut writer = index.writer(15_000_000).unwrap();
 
         let rows: Vec<serde_json::Value> = vec![];
@@ -232,12 +226,9 @@ mod tests {
         let schema = test_schema();
         let tv_schema = schema.build_tantivy_schema();
         let dir = tantivy::directory::RamDirectory::create();
-        let index = tantivy::Index::create(
-            dir,
-            tv_schema.clone(),
-            tantivy::IndexSettings::default(),
-        )
-        .unwrap();
+        let index =
+            tantivy::Index::create(dir, tv_schema.clone(), tantivy::IndexSettings::default())
+                .unwrap();
         let mut writer = index.writer(15_000_000).unwrap();
 
         let rows = vec![
@@ -267,12 +258,9 @@ mod tests {
         let schema = test_schema();
         let tv_schema = schema.build_tantivy_schema();
         let dir = tantivy::directory::RamDirectory::create();
-        let index = tantivy::Index::create(
-            dir,
-            tv_schema.clone(),
-            tantivy::IndexSettings::default(),
-        )
-        .unwrap();
+        let index =
+            tantivy::Index::create(dir, tv_schema.clone(), tantivy::IndexSettings::default())
+                .unwrap();
         let mut writer = index.writer(15_000_000).unwrap();
 
         let segment_size = 50;

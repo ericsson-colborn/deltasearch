@@ -2,7 +2,7 @@
 
 **Embedded search for the lakehouse. ES in your pocket.**
 
-deltasearch is a single-binary search engine that combines tantivy (Rust full-text search) with Delta Lake (versioned data lake). Point it at JSON files or blob storage and you're searching in minutes -- no cluster, no daemon, no JVM. The index is a disposable cache that builds itself from your data.
+deltasearch is a single-binary search engine that combines tantivy (Rust full-text search) with Delta Lake (versioned data lake). Point it at JSON files or blob storage and you're searching in minutes -- no cluster, no daemon, no JVM. The index is incrementally hydrated from your data — Delta Lake is the source of truth, and the index stays fresh via streaming compaction.
 
 ## Quick Start
 

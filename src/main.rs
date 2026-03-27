@@ -298,14 +298,8 @@ async fn run_cli() {
                 force_merge,
                 once,
             };
-            commands::compact::run(
-                &storage,
-                &name,
-                opts,
-                source.as_deref(),
-                schema.as_deref(),
-            )
-            .await
+            commands::compact::run(&storage, &name, opts, source.as_deref(), schema.as_deref())
+                .await
         }
         Commands::Ingest {
             source,

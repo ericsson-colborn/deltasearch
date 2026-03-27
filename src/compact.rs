@@ -171,9 +171,7 @@ impl<'a> CompactWorker<'a> {
         let (row_tx, row_rx) = crossbeam_channel::bounded(100);
 
         // Get removed IDs and stream added rows into channel
-        let removed_ids = delta
-            .changes_since_streaming(index_version, row_tx)
-            .await?;
+        let removed_ids = delta.changes_since_streaming(index_version, row_tx).await?;
 
         // Process deletions first (before upserts, so re-added rows win)
         if !removed_ids.is_empty() {
@@ -203,9 +201,7 @@ impl<'a> CompactWorker<'a> {
                 )?;
                 index_writer.commit()?;
                 total_docs += stats.docs_indexed;
-                eprintln!(
-                    "[dsrch] compact: committed segment {batch_num} ({batch_len} docs)"
-                );
+                eprintln!("[dsrch] compact: committed segment {batch_num} ({batch_len} docs)");
                 batch = Vec::with_capacity(segment_size);
             }
         }
@@ -223,9 +219,7 @@ impl<'a> CompactWorker<'a> {
             )?;
             index_writer.commit()?;
             total_docs += stats.docs_indexed;
-            eprintln!(
-                "[dsrch] compact: committed segment {batch_num} ({batch_len} docs)"
-            );
+            eprintln!("[dsrch] compact: committed segment {batch_num} ({batch_len} docs)");
         }
 
         if total_docs == 0 && removed_ids.is_empty() {

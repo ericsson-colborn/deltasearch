@@ -8,12 +8,12 @@ Fully open-source engine, zero data hosting liability, customer brings their own
 
 ## How It Works
 
-Deltasearch is a single binary. Download it, point it at a Delta table, search. No cluster, no daemon, no JVM. The index is a disposable cache that rebuilds itself from Delta Lake.
+Deltasearch is a single binary. Download it, point it at a Delta table, search. No cluster, no daemon, no JVM. The index is incrementally hydrated from Delta Lake — a persistent asset that stays fresh via streaming compaction.
 
 ```
 Customer's cloud (OneLake / ADLS / S3)
 ├── Delta table (source of truth — customer owns this)
-└── tantivy index (disposable cache — rebuilt from Delta)
+└── tantivy index (incrementally hydrated from Delta)
 
 Compact worker: polls Delta → creates index segments → merges them
 Search client: reads index → returns results
