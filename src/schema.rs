@@ -182,17 +182,44 @@ fn infer_array_element_type(arr: &[serde_json::Value]) -> Option<FieldType> {
 /// Internal fields that should not be inferred from document data.
 const INTERNAL_FIELDS: &[&str] = &["_id", "_source", "__present__"];
 
+/// Recursively flatten a JSON object into dot-notation field entries.
+/// Example: {"user": {"name": "alice"}} -> [("user.name", Value::String("alice"))]
+fn flatten_json_object(
+    prefix: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    out: &mut Vec<(String, serde_json::Value)>,
+) {
+    for (key, value) in obj {
+        let full_key = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match value {
+            serde_json::Value::Object(nested) => {
+                flatten_json_object(&full_key, nested, out);
+            }
+            other => {
+                out.push((full_key, other.clone()));
+            }
+        }
+    }
+}
+
 /// Infer a Schema from a batch of JSON documents.
 ///
 /// Scans all documents and collects the first non-null type for each field.
+/// Nested objects are flattened into dot-notation field names (e.g. `user.name`).
 /// Arrays of homogeneous primitives are supported as multi-valued fields.
-/// Skips internal fields (_id, _source, __present__), objects, mixed arrays,
+/// Skips internal fields (_id, _source, __present__), mixed arrays,
 /// and empty arrays.
 pub fn infer_schema(docs: &[serde_json::Value]) -> Schema {
     let mut fields = BTreeMap::new();
     for doc in docs {
         if let Some(obj) = doc.as_object() {
-            for (key, value) in obj {
+            let mut flat = Vec::new();
+            flatten_json_object("", obj, &mut flat);
+            for (key, value) in &flat {
                 if INTERNAL_FIELDS.contains(&key.as_str()) {
                     continue;
                 }
@@ -264,18 +291,45 @@ fn arrow_type_to_field_type(dt: &arrow::datatypes::DataType) -> Option<FieldType
     }
 }
 
+/// Recursively flatten Arrow struct fields into dot-notation.
+#[cfg(feature = "delta")]
+fn flatten_arrow_fields(
+    prefix: &str,
+    fields: &arrow::datatypes::Fields,
+    out: &mut BTreeMap<String, FieldType>,
+) {
+    for field in fields.iter() {
+        let name = field.name();
+        if name.starts_with('_') {
+            continue;
+        }
+        let full_name = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        match field.data_type() {
+            arrow::datatypes::DataType::Struct(sub_fields) => {
+                flatten_arrow_fields(&full_name, sub_fields, out);
+            }
+            dt => {
+                if let Some(ft) = arrow_type_to_field_type(dt) {
+                    out.insert(full_name, ft);
+                }
+            }
+        }
+    }
+}
+
 /// Infer a SearchDB Schema from an Arrow schema (e.g., from a Delta table).
+/// Struct types are flattened into dot-notation field names (e.g. `user.name`).
 #[cfg(feature = "delta")]
 pub fn from_arrow_schema(arrow_schema: &arrow::datatypes::Schema) -> Schema {
     let mut fields = BTreeMap::new();
-    for field in arrow_schema.fields() {
-        let name = field.name();
-        if INTERNAL_FIELDS.contains(&name.as_str()) {
-            continue;
-        }
-        if let Some(ft) = arrow_type_to_field_type(field.data_type()) {
-            fields.insert(name.clone(), ft);
-        }
+    flatten_arrow_fields("", arrow_schema.fields(), &mut fields);
+    // Remove internal fields that might have been included
+    for name in INTERNAL_FIELDS {
+        fields.remove(*name);
     }
     Schema { fields }
 }
@@ -436,15 +490,16 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_schema_skips_nested_but_handles_arrays() {
+    fn test_infer_schema_flattens_nested_and_handles_arrays() {
         let docs =
             vec![serde_json::json!({"name": "alice", "tags": ["a", "b"], "addr": {"city": "NYC"}})];
         let schema = infer_schema(&docs);
-        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(schema.fields.len(), 3);
         assert!(schema.fields.contains_key("name"));
         assert_eq!(schema.fields["tags"], FieldType::Keyword);
-        // Nested objects still skipped
+        // Nested objects are flattened to dot-notation
         assert!(!schema.fields.contains_key("addr"));
+        assert_eq!(schema.fields["addr.city"], FieldType::Keyword);
     }
 
     #[test]
@@ -582,7 +637,7 @@ mod tests {
         assert_eq!(schema.fields["name"], FieldType::Keyword);
         assert_eq!(schema.fields["tags"], FieldType::Keyword);
         assert_eq!(schema.fields["scores"], FieldType::Numeric);
-        // Struct still skipped
+        // Empty struct still produces no fields
         assert!(!schema.fields.contains_key("meta"));
     }
 
@@ -613,5 +668,53 @@ mod tests {
         assert!(tv_schema.get_field("_source").is_ok());
         assert!(tv_schema.get_field("__present__").is_ok());
         assert!(tv_schema.get_field("name").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_flattens_nested_objects() {
+        let docs = vec![serde_json::json!({
+            "user": {
+                "name": "alice",
+                "age": 30,
+                "address": {
+                    "city": "NYC"
+                }
+            },
+            "status": "active"
+        })];
+        let schema = infer_schema(&docs);
+        assert_eq!(schema.fields.get("user.name"), Some(&FieldType::Keyword));
+        assert_eq!(schema.fields.get("user.age"), Some(&FieldType::Numeric));
+        assert_eq!(
+            schema.fields.get("user.address.city"),
+            Some(&FieldType::Keyword)
+        );
+        assert_eq!(schema.fields.get("status"), Some(&FieldType::Keyword));
+        // Top-level "user" should NOT be a field
+        assert!(!schema.fields.contains_key("user"));
+    }
+
+    #[cfg(feature = "delta")]
+    #[test]
+    fn test_from_arrow_schema_flattens_struct() {
+        use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema};
+
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "user",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("name", DataType::Utf8, true),
+                    Field::new("age", DataType::Int64, true),
+                ])),
+                true,
+            ),
+        ]);
+
+        let schema = from_arrow_schema(&arrow_schema);
+        assert_eq!(schema.fields.get("id"), Some(&FieldType::Keyword));
+        assert_eq!(schema.fields.get("user.name"), Some(&FieldType::Keyword));
+        assert_eq!(schema.fields.get("user.age"), Some(&FieldType::Numeric));
+        assert!(!schema.fields.contains_key("user"));
     }
 }

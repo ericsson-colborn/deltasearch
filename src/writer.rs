@@ -58,6 +58,20 @@ fn add_typed_value(
     Ok(())
 }
 
+/// Resolve a dot-notation path in a JSON value.
+/// Example: resolve_path(doc, "user.name") -> Some(&Value::String("alice"))
+fn resolve_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    // Don't return nested objects — they should be traversed, not indexed
+    if current.is_object() {
+        return None;
+    }
+    Some(current)
+}
+
 /// Build a tantivy `TantivyDocument` from a JSON object.
 ///
 /// Populates:
@@ -65,6 +79,9 @@ fn add_typed_value(
 /// - `_source` — verbatim JSON for round-trip retrieval
 /// - `__present__` — tokens: `__all__` (every doc) + each non-null field name
 /// - User fields — type-dispatched based on schema
+///
+/// Supports dot-notation field names (e.g. `user.name`) by resolving paths
+/// through nested JSON objects.
 pub fn build_document(
     tantivy_schema: &tantivy::schema::Schema,
     app_schema: &Schema,
@@ -88,13 +105,14 @@ pub fn build_document(
     tdoc.add_text(source_field, doc_json.to_string());
     tdoc.add_text(present_field, "__all__");
 
-    // User fields — type-dispatch
-    let obj = doc_json
+    // Verify input is a JSON object
+    let _obj = doc_json
         .as_object()
         .ok_or_else(|| SearchDbError::Schema("document must be a JSON object".into()))?;
 
+    // User fields — type-dispatch (supports dot-notation paths)
     for (field_name, field_type) in &app_schema.fields {
-        let value = match obj.get(field_name) {
+        let value = match resolve_path(doc_json, field_name) {
             Some(serde_json::Value::Null) | None => continue,
             Some(v) => v,
         };
@@ -473,5 +491,122 @@ mod tests {
             .search(&query, &tantivy::collector::TopDocs::with_limit(10))
             .unwrap();
         assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_build_document_nested_objects() {
+        let schema = Schema {
+            fields: BTreeMap::from([
+                ("user.name".into(), FieldType::Keyword),
+                ("user.age".into(), FieldType::Numeric),
+                ("status".into(), FieldType::Keyword),
+            ]),
+        };
+        let tv_schema = schema.build_tantivy_schema();
+        let doc = serde_json::json!({
+            "user": {"name": "alice", "age": 30},
+            "status": "active"
+        });
+        let result = build_document(&tv_schema, &schema, &doc, "test-id");
+        assert!(
+            result.is_ok(),
+            "build_document should handle nested objects"
+        );
+
+        let tdoc = result.unwrap();
+        let name_field = tv_schema.get_field("user.name").unwrap();
+        let values: Vec<&str> = tdoc.get_all(name_field).flat_map(|v| v.as_str()).collect();
+        assert_eq!(values, vec!["alice"]);
+
+        let age_field = tv_schema.get_field("user.age").unwrap();
+        let values: Vec<f64> = tdoc.get_all(age_field).flat_map(|v| v.as_f64()).collect();
+        assert_eq!(values, vec![30.0]);
+
+        let status_field = tv_schema.get_field("status").unwrap();
+        let values: Vec<&str> = tdoc
+            .get_all(status_field)
+            .flat_map(|v| v.as_str())
+            .collect();
+        assert_eq!(values, vec!["active"]);
+
+        // Verify __present__ has the flattened field names
+        let present_field = tv_schema.get_field("__present__").unwrap();
+        let present: Vec<&str> = tdoc
+            .get_all(present_field)
+            .flat_map(|v| v.as_str())
+            .collect();
+        assert!(present.contains(&"user.name"));
+        assert!(present.contains(&"user.age"));
+        assert!(present.contains(&"status"));
+    }
+
+    #[test]
+    fn test_build_document_deeply_nested() {
+        let schema = Schema {
+            fields: BTreeMap::from([("a.b.c".into(), FieldType::Keyword)]),
+        };
+        let tv_schema = schema.build_tantivy_schema();
+        let doc = serde_json::json!({"a": {"b": {"c": "deep"}}});
+        let result = build_document(&tv_schema, &schema, &doc, "test-id");
+        assert!(result.is_ok());
+
+        let tdoc = result.unwrap();
+        let field = tv_schema.get_field("a.b.c").unwrap();
+        let values: Vec<&str> = tdoc.get_all(field).flat_map(|v| v.as_str()).collect();
+        assert_eq!(values, vec!["deep"]);
+    }
+
+    #[test]
+    fn test_nested_object_search_end_to_end() {
+        let schema = Schema {
+            fields: BTreeMap::from([
+                ("user.name".into(), FieldType::Keyword),
+                ("user.age".into(), FieldType::Numeric),
+                ("status".into(), FieldType::Keyword),
+            ]),
+        };
+        let tv_schema = schema.build_tantivy_schema();
+
+        let dir = tempfile::tempdir().unwrap();
+        let index = tantivy::Index::create_in_dir(dir.path(), tv_schema.clone()).unwrap();
+        let mut writer = index.writer(50_000_000).unwrap();
+        let id_field = tv_schema.get_field("_id").unwrap();
+
+        // Index nested documents
+        let doc1 = serde_json::json!({
+            "_id": "1",
+            "user": {"name": "alice", "age": 30},
+            "status": "active"
+        });
+        let doc2 = serde_json::json!({
+            "_id": "2",
+            "user": {"name": "bob", "age": 25},
+            "status": "inactive"
+        });
+        let tdoc1 = build_document(&tv_schema, &schema, &doc1, "1").unwrap();
+        upsert_document(&writer, id_field, tdoc1, "1");
+        let tdoc2 = build_document(&tv_schema, &schema, &doc2, "2").unwrap();
+        upsert_document(&writer, id_field, tdoc2, "2");
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        assert_eq!(searcher.num_docs(), 2);
+
+        // Search by nested field using query string
+        let name_field = tv_schema.get_field("user.name").unwrap();
+        let parser = tantivy::query::QueryParser::for_index(&index, vec![name_field]);
+        let query = parser.parse_query(r#"user.name:"alice""#).unwrap();
+        let results = searcher
+            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Verify the result is the correct doc
+        let source_field = tv_schema.get_field("_source").unwrap();
+        let doc: TantivyDocument = searcher.doc(results[0].1).unwrap();
+        let source = doc.get_first(source_field).unwrap().as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(source).unwrap();
+        assert_eq!(parsed.get("_id").and_then(|v| v.as_str()), Some("1"));
     }
 }
