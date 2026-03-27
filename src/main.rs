@@ -8,6 +8,8 @@ mod es_dsl;
 #[cfg(feature = "delta")]
 mod ingest;
 mod merge_policy;
+#[cfg(feature = "metrics")]
+mod metrics;
 #[cfg(feature = "delta")]
 #[allow(dead_code)]
 mod object_store_dir;
@@ -191,6 +193,10 @@ enum Commands {
         /// One-shot: poll once, segment if needed, merge if needed, exit
         #[arg(long)]
         once: bool,
+        /// Port for Prometheus /metrics endpoint (0 to disable)
+        #[cfg(feature = "metrics")]
+        #[arg(long, default_value_t = 9090)]
+        metrics_port: u16,
     },
 
     /// Ingest raw files (NDJSON, JSON, CSV, Parquet) into a Delta Lake table
@@ -303,6 +309,8 @@ async fn run_cli() {
             max_segment_age,
             force_merge,
             once,
+            #[cfg(feature = "metrics")]
+            metrics_port,
         } => {
             let opts = compact::CompactOptions {
                 segment_size,
@@ -313,8 +321,16 @@ async fn run_cli() {
                 force_merge,
                 once,
             };
-            commands::compact::run(&storage, &name, opts, source.as_deref(), schema.as_deref())
-                .await
+            commands::compact::run(
+                &storage,
+                &name,
+                opts,
+                source.as_deref(),
+                schema.as_deref(),
+                #[cfg(feature = "metrics")]
+                metrics_port,
+            )
+            .await
         }
         Commands::Ingest {
             source,

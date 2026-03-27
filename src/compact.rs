@@ -7,6 +7,8 @@ use tantivy::Index;
 use crate::delta::DeltaSync;
 use crate::error::{Result, SearchDbError};
 use crate::merge_policy::{SegmentMeta, StableLogMergePolicy, StableLogMergePolicyConfig};
+#[cfg(feature = "metrics")]
+use crate::metrics::CompactMetrics;
 use crate::pipeline::{self, PipelineConfig};
 use crate::storage::{CompactMeta, IndexConfig, Storage};
 use crate::writer;
@@ -44,6 +46,8 @@ pub struct CompactWorker<'a> {
     storage: &'a Storage,
     name: String,
     opts: CompactOptions,
+    #[cfg(feature = "metrics")]
+    metrics: Option<CompactMetrics>,
 }
 
 impl<'a> CompactWorker<'a> {
@@ -52,7 +56,15 @@ impl<'a> CompactWorker<'a> {
             storage,
             name: name.to_string(),
             opts,
+            #[cfg(feature = "metrics")]
+            metrics: None,
         }
+    }
+
+    /// Attach Prometheus metrics to this worker.
+    #[cfg(feature = "metrics")]
+    pub fn set_metrics(&mut self, metrics: CompactMetrics) {
+        self.metrics = Some(metrics);
     }
 
     /// Run the compaction loop. Returns when:
@@ -152,12 +164,33 @@ impl<'a> CompactWorker<'a> {
         index_writer: &mut tantivy::IndexWriter,
         id_field: tantivy::schema::Field,
     ) -> Result<bool> {
+        #[cfg(feature = "metrics")]
+        let poll_timer = Instant::now();
+
+        #[cfg(feature = "metrics")]
+        if let Some(ref m) = self.metrics {
+            m.polls_total.inc();
+        }
+
         let mut current_config = self.storage.load_config(&self.name)?;
         let index_version = current_config.index_version.unwrap_or(-1);
 
         let current_version = delta.current_version().await?;
 
+        #[cfg(feature = "metrics")]
+        if let Some(ref m) = self.metrics {
+            m.delta_version.set(current_version as f64);
+            m.index_version.set(index_version as f64);
+            m.gap_versions
+                .set((current_version - index_version).max(0) as f64);
+        }
+
         if current_version <= index_version {
+            #[cfg(feature = "metrics")]
+            if let Some(ref m) = self.metrics {
+                m.poll_duration_seconds
+                    .observe(poll_timer.elapsed().as_secs_f64());
+            }
             return Ok(false);
         }
 
@@ -178,6 +211,11 @@ impl<'a> CompactWorker<'a> {
             let del_count = writer::delete_documents(index_writer, id_field, &removed_ids);
             index_writer.commit()?;
             eprintln!("[dsrch] compact: deleted {del_count} document(s) from removed Delta files");
+
+            #[cfg(feature = "metrics")]
+            if let Some(ref m) = self.metrics {
+                m.documents_deleted_total.inc_by(del_count as f64);
+            }
         }
 
         // Stream rows through pipeline — commit per segment_size batch
@@ -202,6 +240,12 @@ impl<'a> CompactWorker<'a> {
                 index_writer.commit()?;
                 total_docs += stats.docs_indexed;
                 eprintln!("[dsrch] compact: committed segment {batch_num} ({batch_len} docs)");
+
+                #[cfg(feature = "metrics")]
+                if let Some(ref m) = self.metrics {
+                    m.segments_created_total.inc();
+                }
+
                 batch = Vec::with_capacity(segment_size);
             }
         }
@@ -220,12 +264,24 @@ impl<'a> CompactWorker<'a> {
             index_writer.commit()?;
             total_docs += stats.docs_indexed;
             eprintln!("[dsrch] compact: committed segment {batch_num} ({batch_len} docs)");
+
+            #[cfg(feature = "metrics")]
+            if let Some(ref m) = self.metrics {
+                m.segments_created_total.inc();
+            }
         }
 
         if total_docs == 0 && removed_ids.is_empty() {
             eprintln!("[dsrch] compact: no changes to process");
             current_config.index_version = Some(current_version);
             self.save_config_with_compact(&current_config)?;
+
+            #[cfg(feature = "metrics")]
+            if let Some(ref m) = self.metrics {
+                m.poll_duration_seconds
+                    .observe(poll_timer.elapsed().as_secs_f64());
+            }
+
             return Ok(false);
         }
 
@@ -233,6 +289,15 @@ impl<'a> CompactWorker<'a> {
         current_config.index_version = Some(current_version);
         self.save_compact_meta(&mut current_config, true, false)?;
         self.storage.save_config(&self.name, &current_config)?;
+
+        #[cfg(feature = "metrics")]
+        if let Some(ref m) = self.metrics {
+            m.rows_indexed_total.inc_by(total_docs as f64);
+            m.index_version.set(current_version as f64);
+            m.gap_versions.set(0.0);
+            m.poll_duration_seconds
+                .observe(poll_timer.elapsed().as_secs_f64());
+        }
 
         eprintln!(
             "[dsrch] compact: indexed {total_docs} docs in {batch_num} segment(s), now at Delta v{current_version}"
@@ -250,6 +315,11 @@ impl<'a> CompactWorker<'a> {
         let segment_count = segment_metas.len();
 
         eprintln!("[dsrch] compact: merge check: {segment_count} segments");
+
+        #[cfg(feature = "metrics")]
+        if let Some(ref m) = self.metrics {
+            m.segments_count.set(segment_count as f64);
+        }
 
         if segment_count <= 1 {
             return Ok(());
@@ -277,13 +347,30 @@ impl<'a> CompactWorker<'a> {
                 ids.len()
             );
 
+            #[cfg(feature = "metrics")]
+            let merge_timer = Instant::now();
+
             match index_writer.merge(&ids).await {
                 Ok(_) => {
                     eprintln!("[dsrch] compact: merged {} segments into 1", ids.len());
                     did_merge = true;
+
+                    #[cfg(feature = "metrics")]
+                    if let Some(ref m) = self.metrics {
+                        m.merges_total.inc();
+                        m.merge_duration_seconds
+                            .observe(merge_timer.elapsed().as_secs_f64());
+                    }
                 }
                 Err(e) => {
                     eprintln!("[dsrch] compact: merge failed: {e}");
+
+                    #[cfg(feature = "metrics")]
+                    if let Some(ref m) = self.metrics {
+                        m.merge_failures_total.inc();
+                        m.merge_duration_seconds
+                            .observe(merge_timer.elapsed().as_secs_f64());
+                    }
                 }
             }
         }
@@ -296,6 +383,14 @@ impl<'a> CompactWorker<'a> {
             let mut config = self.storage.load_config(&self.name)?;
             self.save_compact_meta(&mut config, false, true)?;
             self.storage.save_config(&self.name, &config)?;
+
+            // Update segment count after merge
+            #[cfg(feature = "metrics")]
+            if let Some(ref m) = self.metrics {
+                if let Ok(metas) = self.read_segment_metas(index) {
+                    m.segments_count.set(metas.len() as f64);
+                }
+            }
         }
 
         Ok(())

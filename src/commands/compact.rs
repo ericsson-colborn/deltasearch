@@ -13,6 +13,7 @@ pub async fn run(
     opts: CompactOptions,
     source: Option<&str>,
     schema_json: Option<&str>,
+    #[cfg(feature = "metrics")] metrics_port: u16,
 ) -> Result<()> {
     // Auto-setup: if index doesn't exist, create it from --source
     if !storage.exists(name) {
@@ -33,7 +34,22 @@ pub async fn run(
         }
     }
 
-    let worker = CompactWorker::new(storage, name, opts);
+    #[allow(unused_mut)]
+    let mut worker = CompactWorker::new(storage, name, opts);
+
+    // Set up Prometheus metrics server if enabled
+    #[cfg(feature = "metrics")]
+    let _metrics_handle = if metrics_port > 0 {
+        let registry = prometheus::Registry::new();
+        let metrics = crate::metrics::CompactMetrics::new(&registry);
+        worker.set_metrics(metrics);
+        let addr = format!("0.0.0.0:{metrics_port}");
+        Some(tokio::spawn(crate::metrics::start_metrics_server(
+            addr, registry,
+        )))
+    } else {
+        None
+    };
 
     // Set up shutdown signal handler
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -67,6 +83,12 @@ pub async fn run(
 
     // Cancel signal handler if worker finished on its own (--once / --force-merge)
     signal_handle.abort();
+
+    // Cancel metrics server if running
+    #[cfg(feature = "metrics")]
+    if let Some(handle) = _metrics_handle {
+        handle.abort();
+    }
 
     result
 }
