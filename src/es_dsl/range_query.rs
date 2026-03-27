@@ -50,9 +50,11 @@ impl RangeQuery {
         match field_type {
             FieldType::Numeric => compile_numeric(field, params),
             FieldType::Date => compile_date(field, params),
-            other => Err(SearchDbError::Schema(format!(
-                "range query not supported on {other:?} field \"{field_name}\" -- use numeric or date fields"
-            ))),
+            FieldType::Boolean | FieldType::Ip | FieldType::Keyword | FieldType::Text => {
+                Err(SearchDbError::Schema(format!(
+                    "range query not supported on {field_type:?} field \"{field_name}\" -- use numeric or date fields"
+                )))
+            }
         }
     }
 }

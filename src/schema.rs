@@ -2,7 +2,9 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
-use tantivy::schema::{DateOptions, NumericOptions, SchemaBuilder, TextFieldIndexing, TextOptions};
+use tantivy::schema::{
+    DateOptions, IpAddrOptions, NumericOptions, SchemaBuilder, TextFieldIndexing, TextOptions,
+};
 
 static ISO_DATETIME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}").unwrap());
@@ -25,6 +27,11 @@ pub fn looks_like_date(s: &str) -> bool {
     ISO_DATETIME_RE.is_match(s) || is_valid_yyyymmdd(s)
 }
 
+/// Returns true if the string parses as a valid IPv4 or IPv6 address.
+fn looks_like_ip(s: &str) -> bool {
+    s.parse::<std::net::IpAddr>().is_ok()
+}
+
 /// SearchDB field types — maps to ES-like concepts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -37,6 +44,10 @@ pub enum FieldType {
     Numeric,
     /// ISO 8601 datetime — range queries
     Date,
+    /// Native boolean (true/false)
+    Boolean,
+    /// IPv4 or IPv6 address (stored as IPv6 internally)
+    Ip,
 }
 
 /// Schema declaration — maps field names to types.
@@ -111,6 +122,20 @@ impl Schema {
                     let opts = DateOptions::default().set_stored().set_indexed().set_fast();
                     builder.add_date_field(name, opts);
                 }
+                FieldType::Boolean => {
+                    let opts = NumericOptions::default()
+                        .set_stored()
+                        .set_indexed()
+                        .set_fast();
+                    builder.add_bool_field(name, opts);
+                }
+                FieldType::Ip => {
+                    let opts = IpAddrOptions::default()
+                        .set_stored()
+                        .set_indexed()
+                        .set_fast();
+                    builder.add_ip_addr_field(name, opts);
+                }
             }
         }
 
@@ -123,16 +148,18 @@ impl Schema {
 /// Returns None for null and objects (not indexable).
 /// Arrays of homogeneous primitives are supported: the element type is inferred.
 /// Mixed-type arrays, nested arrays, and empty arrays return None.
-/// Strings are checked for ISO 8601 datetime pattern before defaulting to keyword.
-/// Booleans are treated as keywords ("true"/"false").
+/// Strings are checked for ISO 8601 datetime and IP address patterns before defaulting to keyword.
+/// Booleans map to FieldType::Boolean.
 pub fn infer_field_type(value: &serde_json::Value) -> Option<FieldType> {
     match value {
         serde_json::Value::Null => None,
-        serde_json::Value::Bool(_) => Some(FieldType::Keyword),
+        serde_json::Value::Bool(_) => Some(FieldType::Boolean),
         serde_json::Value::Number(_) => Some(FieldType::Numeric),
         serde_json::Value::String(s) => {
             if looks_like_date(s) {
                 Some(FieldType::Date)
+            } else if looks_like_ip(s) {
+                Some(FieldType::Ip)
             } else {
                 Some(FieldType::Keyword)
             }
@@ -155,11 +182,13 @@ fn infer_array_element_type(arr: &[serde_json::Value]) -> Option<FieldType> {
     })?;
 
     let base_type = match first_type {
-        serde_json::Value::Bool(_) => FieldType::Keyword,
+        serde_json::Value::Bool(_) => FieldType::Boolean,
         serde_json::Value::Number(_) => FieldType::Numeric,
         serde_json::Value::String(s) => {
             if looks_like_date(s) {
                 FieldType::Date
+            } else if looks_like_ip(s) {
+                FieldType::Ip
             } else {
                 FieldType::Keyword
             }
@@ -172,11 +201,13 @@ fn infer_array_element_type(arr: &[serde_json::Value]) -> Option<FieldType> {
     // Verify all non-null elements are the same type
     let all_match = arr.iter().all(|v| match v {
         serde_json::Value::Null => true,
-        serde_json::Value::Bool(_) => matches!(base_type, FieldType::Keyword),
+        serde_json::Value::Bool(_) => matches!(base_type, FieldType::Boolean),
         serde_json::Value::Number(_) => matches!(base_type, FieldType::Numeric),
         serde_json::Value::String(s) => {
             if looks_like_date(s) {
                 matches!(base_type, FieldType::Date)
+            } else if looks_like_ip(s) {
+                matches!(base_type, FieldType::Ip)
             } else {
                 matches!(base_type, FieldType::Keyword)
             }
@@ -283,7 +314,7 @@ fn arrow_type_to_field_type(dt: &arrow::datatypes::DataType) -> Option<FieldType
     use arrow::datatypes::DataType;
     match dt {
         DataType::Utf8 | DataType::LargeUtf8 => Some(FieldType::Keyword),
-        DataType::Boolean => Some(FieldType::Keyword),
+        DataType::Boolean => Some(FieldType::Boolean),
         DataType::Int8
         | DataType::Int16
         | DataType::Int32
@@ -397,10 +428,38 @@ mod tests {
     fn test_infer_field_type_boolean() {
         assert_eq!(
             infer_field_type(&serde_json::json!(true)),
-            Some(FieldType::Keyword)
+            Some(FieldType::Boolean)
         );
         assert_eq!(
             infer_field_type(&serde_json::json!(false)),
+            Some(FieldType::Boolean)
+        );
+    }
+
+    #[test]
+    fn test_infer_boolean_field() {
+        assert_eq!(
+            infer_field_type(&serde_json::json!(true)),
+            Some(FieldType::Boolean)
+        );
+        assert_eq!(
+            infer_field_type(&serde_json::json!(false)),
+            Some(FieldType::Boolean)
+        );
+    }
+
+    #[test]
+    fn test_infer_ip_field() {
+        assert_eq!(
+            infer_field_type(&serde_json::json!("192.168.1.1")),
+            Some(FieldType::Ip)
+        );
+        assert_eq!(
+            infer_field_type(&serde_json::json!("::1")),
+            Some(FieldType::Ip)
+        );
+        assert_eq!(
+            infer_field_type(&serde_json::json!("not-an-ip")),
             Some(FieldType::Keyword)
         );
     }
@@ -466,6 +525,22 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_field_type_array_of_booleans() {
+        assert_eq!(
+            infer_field_type(&serde_json::json!([true, false, true])),
+            Some(FieldType::Boolean)
+        );
+    }
+
+    #[test]
+    fn test_infer_field_type_array_of_ips() {
+        assert_eq!(
+            infer_field_type(&serde_json::json!(["192.168.1.1", "10.0.0.1"])),
+            Some(FieldType::Ip)
+        );
+    }
+
+    #[test]
     fn test_infer_field_type_object() {
         assert_eq!(infer_field_type(&serde_json::json!({"nested": true})), None);
     }
@@ -480,7 +555,7 @@ mod tests {
         assert_eq!(schema.fields["name"], FieldType::Keyword);
         assert_eq!(schema.fields["age"], FieldType::Numeric);
         assert_eq!(schema.fields["created"], FieldType::Date);
-        assert_eq!(schema.fields["active"], FieldType::Keyword);
+        assert_eq!(schema.fields["active"], FieldType::Boolean);
         assert_eq!(schema.fields.len(), 4);
     }
 
@@ -617,7 +692,7 @@ mod tests {
         assert_eq!(schema.fields["name"], FieldType::Keyword);
         assert_eq!(schema.fields["age"], FieldType::Numeric);
         assert_eq!(schema.fields["created"], FieldType::Date);
-        assert_eq!(schema.fields["active"], FieldType::Keyword);
+        assert_eq!(schema.fields["active"], FieldType::Boolean);
     }
 
     #[cfg(feature = "delta")]
@@ -666,27 +741,18 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_from_json_bool_and_ip() {
+        let json = r#"{"fields":{"active":"boolean","host":"ip","name":"keyword"}}"#;
+        let schema = Schema::from_json(json).unwrap();
+        assert_eq!(schema.fields["active"], FieldType::Boolean);
+        assert_eq!(schema.fields["host"], FieldType::Ip);
+        assert_eq!(schema.fields["name"], FieldType::Keyword);
+    }
+
+    #[test]
     fn test_schema_invalid_json() {
         let result = Schema::from_json("not json");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_looks_like_date_yyyymmdd() {
-        assert!(looks_like_date("20260315"));
-        assert!(looks_like_date("20001231"));
-        assert!(!looks_like_date("99999999")); // invalid month (99)
-        assert!(!looks_like_date("20261301")); // month 13
-        assert!(!looks_like_date("20260132")); // day 32
-        assert!(!looks_like_date("2026031")); // too short
-        assert!(!looks_like_date("202603155")); // too long
-        assert!(!looks_like_date("12345678")); // month=56, invalid
-    }
-
-    #[test]
-    fn test_infer_yyyymmdd_as_date() {
-        let ft = infer_field_type(&serde_json::json!("20260315"));
-        assert_eq!(ft, Some(FieldType::Date));
     }
 
     #[test]
@@ -699,6 +765,19 @@ mod tests {
         assert!(tv_schema.get_field("_source").is_ok());
         assert!(tv_schema.get_field("__present__").is_ok());
         assert!(tv_schema.get_field("name").is_ok());
+    }
+
+    #[test]
+    fn test_build_schema_with_bool_and_ip() {
+        let schema = Schema {
+            fields: BTreeMap::from([
+                ("active".into(), FieldType::Boolean),
+                ("host".into(), FieldType::Ip),
+            ]),
+        };
+        let tv = schema.build_tantivy_schema();
+        assert!(tv.get_field("active").is_ok());
+        assert!(tv.get_field("host").is_ok());
     }
 
     #[test]
@@ -723,6 +802,24 @@ mod tests {
         assert_eq!(schema.fields.get("status"), Some(&FieldType::Keyword));
         // Top-level "user" should NOT be a field
         assert!(!schema.fields.contains_key("user"));
+    }
+
+    #[test]
+    fn test_looks_like_date_yyyymmdd() {
+        assert!(looks_like_date("20260315"));
+        assert!(looks_like_date("20001231"));
+        assert!(!looks_like_date("99999999")); // invalid month (99)
+        assert!(!looks_like_date("20261301")); // month 13
+        assert!(!looks_like_date("20260132")); // day 32
+        assert!(!looks_like_date("2026031")); // too short
+        assert!(!looks_like_date("202603155")); // too long
+        assert!(!looks_like_date("12345678")); // month=56, invalid
+    }
+
+    #[test]
+    fn test_infer_yyyymmdd_as_date() {
+        let ft = infer_field_type(&serde_json::json!("20260315"));
+        assert_eq!(ft, Some(FieldType::Date));
     }
 
     #[cfg(feature = "delta")]

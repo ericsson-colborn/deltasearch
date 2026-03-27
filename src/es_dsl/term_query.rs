@@ -75,6 +75,40 @@ impl TermQuery {
                 let dt = parse_date_to_tantivy(date_str)?;
                 Term::from_field_date(field, dt)
             }
+            FieldType::Boolean => {
+                let text = json_val.as_str().ok_or_else(|| {
+                    SearchDbError::Schema(format!(
+                        "term query on field \"{field_name}\" expected boolean string, got {json_val}"
+                    ))
+                })?;
+                let b = match text {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(SearchDbError::Schema(format!(
+                            "term query on field \"{field_name}\" expected \"true\" or \"false\", got \"{text}\""
+                        )))
+                    }
+                };
+                Term::from_field_bool(field, b)
+            }
+            FieldType::Ip => {
+                let ip_str = json_val.as_str().ok_or_else(|| {
+                    SearchDbError::Schema(format!(
+                        "term query on field \"{field_name}\" expected IP string, got {json_val}"
+                    ))
+                })?;
+                let ip: std::net::Ipv6Addr = match ip_str.parse::<std::net::IpAddr>() {
+                    Ok(std::net::IpAddr::V4(v4)) => v4.to_ipv6_mapped(),
+                    Ok(std::net::IpAddr::V6(v6)) => v6,
+                    Err(e) => {
+                        return Err(SearchDbError::Schema(format!(
+                            "term query on field \"{field_name}\" invalid IP \"{ip_str}\": {e}"
+                        )))
+                    }
+                };
+                Term::from_field_ip_addr(field, ip)
+            }
         };
 
         Ok(Box::new(tantivy::query::TermQuery::new(

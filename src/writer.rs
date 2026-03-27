@@ -21,7 +21,8 @@ pub fn make_doc_id(doc: &serde_json::Value) -> String {
 
 /// Add a single typed value to a tantivy document field.
 ///
-/// Dispatches on the field type: text for keyword/text, f64 for numeric, date for date.
+/// Dispatches on the field type: text for keyword/text, f64 for numeric,
+/// date for date, bool for boolean, Ipv6Addr for ip.
 fn add_typed_value(
     tdoc: &mut TantivyDocument,
     field: tantivy::schema::Field,
@@ -53,6 +54,31 @@ fn add_typed_value(
             })?;
             let parsed = parse_date(date_str)?;
             tdoc.add_date(field, parsed);
+        }
+        FieldType::Boolean => {
+            let b = value.as_bool().ok_or_else(|| {
+                SearchDbError::Schema(format!(
+                    "field '{field_name}' expected boolean, got {value}"
+                ))
+            })?;
+            tdoc.add_bool(field, b);
+        }
+        FieldType::Ip => {
+            let ip_str = value.as_str().ok_or_else(|| {
+                SearchDbError::Schema(format!(
+                    "field '{field_name}' expected IP string, got {value}"
+                ))
+            })?;
+            let ip: std::net::Ipv6Addr = match ip_str.parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(v4)) => v4.to_ipv6_mapped(),
+                Ok(std::net::IpAddr::V6(v6)) => v6,
+                Err(e) => {
+                    return Err(SearchDbError::Schema(format!(
+                        "field '{field_name}' invalid IP address '{ip_str}': {e}"
+                    )));
+                }
+            };
+            tdoc.add_ip_addr(field, ip);
         }
     }
     Ok(())
@@ -450,6 +476,20 @@ mod tests {
         let born_field = tv_schema.get_field("born").unwrap();
         let date_values: Vec<_> = tdoc.get_all(born_field).collect();
         assert_eq!(date_values.len(), 1);
+    }
+
+    #[test]
+    fn test_build_document_with_bool_and_ip() {
+        let schema = Schema {
+            fields: BTreeMap::from([
+                ("active".into(), FieldType::Boolean),
+                ("host".into(), FieldType::Ip),
+            ]),
+        };
+        let tv_schema = schema.build_tantivy_schema();
+        let doc = serde_json::json!({"_id": "1", "active": true, "host": "10.0.0.1"});
+        let result = build_document(&tv_schema, &schema, &doc, "1");
+        assert!(result.is_ok(), "build_document failed: {:?}", result.err());
     }
 
     #[test]
