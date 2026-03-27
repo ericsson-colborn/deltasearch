@@ -137,22 +137,6 @@ enum Commands {
         name: String,
     },
 
-    /// Attach a Delta Lake source and perform initial full load
-    #[cfg(feature = "delta")]
-    ConnectDelta {
-        /// Index name
-        name: String,
-        /// Path or URI to Delta table root
-        #[arg(long)]
-        source: String,
-        /// Schema JSON (optional — inferred from Arrow schema if omitted)
-        #[arg(long)]
-        schema: Option<String>,
-        /// Print inferred schema as JSON and exit without creating
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
-    },
-
     /// Full rebuild from Delta Lake source
     #[cfg(feature = "delta")]
     Reindex {
@@ -163,11 +147,18 @@ enum Commands {
         as_of_version: Option<i64>,
     },
 
-    /// Run the compaction worker (segment creation + merge)
+    /// Run the compaction worker (segment creation + merge).
+    /// If the index doesn't exist, creates it and performs initial load from --source.
     #[cfg(feature = "delta")]
     Compact {
         /// Index name
         name: String,
+        /// Delta Lake source (path or URI). Required on first run, saved for subsequent runs.
+        #[arg(long)]
+        source: Option<String>,
+        /// Schema JSON (optional — inferred from Delta's Arrow schema if omitted)
+        #[arg(long)]
+        schema: Option<String>,
         /// Rows per segment before commit
         #[arg(long, default_value_t = 10_000)]
         segment_size: usize,
@@ -282,20 +273,14 @@ async fn run_cli() {
             commands::stats::run(&storage, &name, fmt, gap_info)
         }
         Commands::Drop { name } => commands::drop::run(&storage, &name),
-        Commands::ConnectDelta {
-            name,
-            source,
-            schema,
-            dry_run,
-        } => {
-            commands::connect_delta::run(&storage, &name, &source, schema.as_deref(), dry_run).await
-        }
         Commands::Reindex {
             name,
             as_of_version,
         } => commands::reindex::run(&storage, &name, as_of_version).await,
         Commands::Compact {
             name,
+            source,
+            schema,
             segment_size,
             merge_interval,
             max_segments,
@@ -313,7 +298,14 @@ async fn run_cli() {
                 force_merge,
                 once,
             };
-            commands::compact::run(&storage, &name, opts).await
+            commands::compact::run(
+                &storage,
+                &name,
+                opts,
+                source.as_deref(),
+                schema.as_deref(),
+            )
+            .await
         }
         Commands::Ingest {
             source,

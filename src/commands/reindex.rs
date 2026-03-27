@@ -18,7 +18,7 @@ pub async fn run(storage: &Storage, name: &str, as_of_version: Option<i64>) -> R
 
     let source = config.delta_source.as_deref().ok_or_else(|| {
         SearchDbError::Delta(format!(
-            "index '{name}' has no Delta source — use connect-delta first"
+            "index '{name}' has no Delta source — use compact --source <uri> first"
         ))
     })?;
 

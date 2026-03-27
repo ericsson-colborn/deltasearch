@@ -3,9 +3,34 @@ use crate::error::{Result, SearchDbError};
 use crate::storage::Storage;
 
 /// Run the compact worker with the given CLI options.
-pub async fn run(storage: &Storage, name: &str, opts: CompactOptions) -> Result<()> {
+///
+/// If the index doesn't exist and `source` is provided, creates the index
+/// and performs an initial full load before starting the compaction loop.
+/// This is the "zero to hero" path: one command to go from nothing to searching.
+pub async fn run(
+    storage: &Storage,
+    name: &str,
+    opts: CompactOptions,
+    source: Option<&str>,
+    schema_json: Option<&str>,
+) -> Result<()> {
+    // Auto-setup: if index doesn't exist, create it from --source
     if !storage.exists(name) {
-        return Err(SearchDbError::IndexNotFound(name.to_string()));
+        let source = source.ok_or_else(|| {
+            SearchDbError::IndexNotFound(format!(
+                "index '{name}' not found. Use --source <delta-uri> to create it"
+            ))
+        })?;
+        eprintln!("[dsrch] compact: index '{name}' not found, creating from Delta source...");
+        super::connect_delta::run(storage, name, source, schema_json, false).await?;
+    } else if let Some(source) = source {
+        // Index exists but --source provided: update the Delta source
+        let mut config = storage.load_config(name)?;
+        if config.delta_source.as_deref() != Some(source) {
+            config.delta_source = Some(source.to_string());
+            storage.save_config(name, &config)?;
+            eprintln!("[dsrch] compact: updated Delta source to {source}");
+        }
     }
 
     let worker = CompactWorker::new(storage, name, opts);

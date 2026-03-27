@@ -63,7 +63,7 @@ impl<'a> CompactWorker<'a> {
         let config = self.storage.load_config(&self.name)?;
         let source = config.delta_source.as_deref().ok_or_else(|| {
             SearchDbError::Delta(format!(
-                "index '{}' has no Delta source — use connect-delta first",
+                "index '{}' has no Delta source — use compact --source <uri>",
                 self.name
             ))
         })?;
