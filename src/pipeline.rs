@@ -20,13 +20,10 @@ use crate::error::{Result, SearchDbError};
 use crate::schema::Schema;
 use crate::writer;
 
-// Pipeline is wired in by Task A4; suppress dead_code until then.
-#[allow(dead_code)]
 const CHANNEL_CAP: usize = 100;
 
 /// Configuration for the pipeline.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PipelineConfig {
     /// Number of document-builder threads. Default: available_parallelism / 4, min 1.
     pub num_builders: usize,
@@ -48,14 +45,12 @@ impl Default for PipelineConfig {
 
 /// Stats returned after pipeline completes.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct PipelineStats {
     pub docs_indexed: u64,
     pub errors: u64,
 }
 
 /// A built document ready for indexing.
-#[allow(dead_code)]
 struct BuiltDoc {
     doc: tantivy::TantivyDocument,
     doc_id: String,
@@ -65,7 +60,6 @@ struct BuiltDoc {
 ///
 /// The caller retains ownership of the IndexWriter — the pipeline does NOT commit.
 /// This allows the caller to control commit boundaries (e.g., per segment_size batch).
-#[allow(dead_code)]
 pub fn run_pipeline(
     rows: impl Iterator<Item = serde_json::Value> + Send + 'static,
     tv_schema: &tantivy::schema::Schema,

@@ -7,6 +7,7 @@ use tantivy::Index;
 use crate::delta::DeltaSync;
 use crate::error::{Result, SearchDbError};
 use crate::merge_policy::{SegmentMeta, StableLogMergePolicy, StableLogMergePolicyConfig};
+use crate::pipeline::{self, PipelineConfig};
 use crate::storage::{CompactMeta, IndexConfig, Storage};
 use crate::writer;
 
@@ -182,8 +183,8 @@ impl<'a> CompactWorker<'a> {
             eprintln!("[dsrch] compact: deleted {del_count} document(s) from removed Delta files");
         }
 
-        // Process added rows
-        let rows = &changes.added_rows;
+        // Process added rows via parallel pipeline
+        let rows = changes.added_rows;
         if !rows.is_empty() {
             eprintln!(
                 "[dsrch] compact: read {} rows from Delta v{}..v{}",
@@ -192,30 +193,38 @@ impl<'a> CompactWorker<'a> {
                 current_version
             );
 
-            // Split into batches of segment_size
-            let batches: Vec<&[serde_json::Value]> = rows.chunks(self.opts.segment_size).collect();
+            let pipeline_config = PipelineConfig::default();
+
+            // Split into batches of segment_size, commit after each
+            let batches: Vec<Vec<serde_json::Value>> = rows
+                .chunks(self.opts.segment_size)
+                .map(|c| c.to_vec())
+                .collect();
             let num_batches = batches.len();
 
             for (i, batch) in batches.into_iter().enumerate() {
-                for row in batch {
-                    let doc_id = writer::make_doc_id(row);
-                    let doc = writer::build_document(
-                        tantivy_schema,
-                        &initial_config.schema,
-                        row,
-                        &doc_id,
-                    )?;
-                    writer::upsert_document(index_writer, id_field, doc, &doc_id);
-                }
+                let batch_len = batch.len();
+                let stats = pipeline::run_pipeline(
+                    batch.into_iter(),
+                    tantivy_schema,
+                    &initial_config.schema,
+                    index_writer,
+                    pipeline_config.clone(),
+                )?;
 
                 index_writer.commit()?;
 
-                eprintln!(
-                    "[dsrch] compact: committed segment {}/{} ({} docs)",
-                    i + 1,
-                    num_batches,
-                    batch.len()
-                );
+                if stats.errors > 0 {
+                    eprintln!(
+                        "[dsrch] compact: segment {}/{} — {} docs, {} errors",
+                        i + 1, num_batches, batch_len, stats.errors
+                    );
+                } else {
+                    eprintln!(
+                        "[dsrch] compact: committed segment {}/{} ({} docs)",
+                        i + 1, num_batches, batch_len
+                    );
+                }
             }
         }
 
