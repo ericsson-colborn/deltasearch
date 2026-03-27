@@ -112,6 +112,9 @@ enum Commands {
         /// Include relevance score in output
         #[arg(long, default_value_t = false)]
         score: bool,
+        /// Sort by field (e.g., "views", "views:asc", "published:desc"). Default order: desc.
+        #[arg(long)]
+        sort: Option<String>,
     },
 
     /// Get a single document by _id
@@ -245,6 +248,7 @@ async fn run_cli() {
             offset,
             fields,
             score,
+            sort,
         } => {
             let (gap_rows, _) = read_gap(&storage, &name).await;
             commands::search::run(
@@ -258,6 +262,7 @@ async fn run_cli() {
                 score,
                 fmt,
                 &gap_rows,
+                sort.as_deref(),
             )
         }
         Commands::Get {
@@ -405,6 +410,7 @@ fn run_cli_sync() {
             offset,
             fields,
             score,
+            sort,
         } => commands::search::run(
             &storage,
             &name,
@@ -416,6 +422,7 @@ fn run_cli_sync() {
             score,
             fmt,
             &[],
+            sort.as_deref(),
         ),
         Commands::Get {
             name,

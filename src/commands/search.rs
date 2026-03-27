@@ -21,6 +21,7 @@ pub fn run(
     include_score: bool,
     fmt: OutputFormat,
     gap_rows: &[serde_json::Value],
+    sort: Option<&str>,
 ) -> Result<()> {
     if query.is_none() && dsl.is_none() {
         return Err(SearchDbError::Schema(
@@ -46,6 +47,7 @@ pub fn run(
             fields.as_deref(),
             include_score,
             gap_rows,
+            sort,
         )?
     } else {
         let query_str = query.expect("query or dsl must be provided");
@@ -58,6 +60,7 @@ pub fn run(
             fields.as_deref(),
             include_score,
             gap_rows,
+            sort,
         )?
     };
 

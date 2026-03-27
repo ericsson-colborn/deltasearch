@@ -2,11 +2,11 @@ use tantivy::collector::TopDocs;
 use tantivy::directory::RamDirectory;
 use tantivy::query::QueryParser;
 use tantivy::schema::Value;
-use tantivy::{Index, TantivyDocument};
+use tantivy::{Index, Order, TantivyDocument};
 
 use crate::error::{Result, SearchDbError};
 use crate::es_dsl::ElasticQueryDsl;
-use crate::schema::Schema;
+use crate::schema::{FieldType, Schema};
 
 /// A single search hit — parsed from _source with metadata.
 #[derive(Debug)]
@@ -16,9 +16,38 @@ pub struct SearchHit {
     pub score: f32,
 }
 
+/// Parsed sort specification.
+struct SortSpec {
+    field_name: String,
+    order: Order,
+}
+
+/// Parse a sort string like "field", "field:asc", or "field:desc".
+/// Default order is descending (highest first, matching score semantics).
+fn parse_sort(sort_str: &str) -> SortSpec {
+    if let Some((field, dir)) = sort_str.rsplit_once(':') {
+        let order = if dir.eq_ignore_ascii_case("asc") {
+            Order::Asc
+        } else {
+            Order::Desc
+        };
+        SortSpec {
+            field_name: field.to_string(),
+            order,
+        }
+    } else {
+        SortSpec {
+            field_name: sort_str.to_string(),
+            order: Order::Desc,
+        }
+    }
+}
+
 /// Execute a pre-built tantivy query and return results.
 ///
 /// Shared by both the query string path (`search()`) and the DSL path (`search_dsl()`).
+/// When `sort` is provided, results are ordered by the named fast field instead of BM25.
+#[allow(clippy::too_many_arguments)]
 fn execute_query(
     index: &Index,
     query: &dyn tantivy::query::Query,
@@ -26,14 +55,14 @@ fn execute_query(
     offset: usize,
     fields: Option<&[String]>,
     include_score: bool,
+    sort: Option<&str>,
+    app_schema: &Schema,
 ) -> Result<Vec<SearchHit>> {
     let tv_schema = index.schema();
     let reader = index
         .reader()
         .map_err(|e| SearchDbError::Schema(format!("failed to open reader: {e}")))?;
     let searcher = reader.searcher();
-
-    let top_docs = searcher.search(query, &TopDocs::with_limit(limit + offset))?;
 
     let source_field = tv_schema
         .get_field("_source")
@@ -42,20 +71,60 @@ fn execute_query(
         .get_field("_id")
         .map_err(|_| SearchDbError::Schema("missing _id field".into()))?;
 
-    let mut results = Vec::new();
-    for (score, doc_address) in top_docs.into_iter().skip(offset) {
-        let doc: TantivyDocument = searcher.doc(doc_address)?;
-        let hit = doc_to_hit(&doc, source_field, id_field, score, fields, include_score)?;
-        results.push(hit);
-    }
+    if let Some(sort_str) = sort {
+        let spec = parse_sort(sort_str);
 
-    Ok(results)
+        let field_type = app_schema.fields.get(&spec.field_name).ok_or_else(|| {
+            SearchDbError::Schema(format!("sort field '{}' not in schema", spec.field_name))
+        })?;
+
+        match field_type {
+            FieldType::Numeric => {
+                let collector = TopDocs::with_limit(limit + offset)
+                    .order_by_fast_field::<f64>(&spec.field_name, spec.order);
+                let top_docs = searcher.search(query, &collector)?;
+                let mut results = Vec::new();
+                for (_sort_val, doc_address) in top_docs.into_iter().skip(offset) {
+                    let doc: TantivyDocument = searcher.doc(doc_address)?;
+                    let hit = doc_to_hit(&doc, source_field, id_field, 0.0, fields, include_score)?;
+                    results.push(hit);
+                }
+                Ok(results)
+            }
+            FieldType::Date => {
+                let collector = TopDocs::with_limit(limit + offset)
+                    .order_by_fast_field::<tantivy::DateTime>(&spec.field_name, spec.order);
+                let top_docs = searcher.search(query, &collector)?;
+                let mut results = Vec::new();
+                for (_sort_val, doc_address) in top_docs.into_iter().skip(offset) {
+                    let doc: TantivyDocument = searcher.doc(doc_address)?;
+                    let hit = doc_to_hit(&doc, source_field, id_field, 0.0, fields, include_score)?;
+                    results.push(hit);
+                }
+                Ok(results)
+            }
+            _ => Err(SearchDbError::Schema(format!(
+                "sort field '{}' must be numeric or date (got {:?})",
+                spec.field_name, field_type
+            ))),
+        }
+    } else {
+        let top_docs = searcher.search(query, &TopDocs::with_limit(limit + offset))?;
+        let mut results = Vec::new();
+        for (score, doc_address) in top_docs.into_iter().skip(offset) {
+            let doc: TantivyDocument = searcher.doc(doc_address)?;
+            let hit = doc_to_hit(&doc, source_field, id_field, score, fields, include_score)?;
+            results.push(hit);
+        }
+        Ok(results)
+    }
 }
 
 /// Execute a query string search against a tantivy index.
 ///
 /// Uses tantivy's QueryParser with all user fields + system fields as defaults.
 /// Returns results from `_source` with optional field projection.
+#[allow(clippy::too_many_arguments)]
 pub fn search(
     index: &Index,
     app_schema: &Schema,
@@ -64,6 +133,7 @@ pub fn search(
     offset: usize,
     fields: Option<&[String]>,
     include_score: bool,
+    sort: Option<&str>,
 ) -> Result<Vec<SearchHit>> {
     let tv_schema = index.schema();
 
@@ -86,12 +156,22 @@ pub fn search(
         .parse_query(query_str)
         .map_err(|e| SearchDbError::Schema(format!("query parse failed: {e}")))?;
 
-    execute_query(index, query.as_ref(), limit, offset, fields, include_score)
+    execute_query(
+        index,
+        query.as_ref(),
+        limit,
+        offset,
+        fields,
+        include_score,
+        sort,
+        app_schema,
+    )
 }
 
 /// Execute an Elasticsearch DSL query against a tantivy index.
 ///
 /// Parses the JSON DSL, compiles it to a tantivy query, and executes.
+#[allow(clippy::too_many_arguments)]
 pub fn search_dsl(
     index: &Index,
     app_schema: &Schema,
@@ -100,6 +180,7 @@ pub fn search_dsl(
     offset: usize,
     fields: Option<&[String]>,
     include_score: bool,
+    sort: Option<&str>,
 ) -> Result<Vec<SearchHit>> {
     let tv_schema = index.schema();
 
@@ -108,7 +189,16 @@ pub fn search_dsl(
         .map_err(|e| SearchDbError::Schema(format!("DSL parse error: {e}")))?;
     let query = es_query.compile(&tv_schema, app_schema)?;
 
-    execute_query(index, query.as_ref(), limit, offset, fields, include_score)
+    execute_query(
+        index,
+        query.as_ref(),
+        limit,
+        offset,
+        fields,
+        include_score,
+        sort,
+        app_schema,
+    )
 }
 
 /// Two-tier DSL search: persistent index + ephemeral gap index, dedup by _id.
@@ -122,6 +212,7 @@ pub fn search_dsl_with_gap(
     fields: Option<&[String]>,
     include_score: bool,
     gap_rows: &[serde_json::Value],
+    sort: Option<&str>,
 ) -> Result<Vec<SearchHit>> {
     if gap_rows.is_empty() {
         return search_dsl(
@@ -132,6 +223,7 @@ pub fn search_dsl_with_gap(
             offset,
             fields,
             include_score,
+            sort,
         );
     }
 
@@ -147,6 +239,7 @@ pub fn search_dsl_with_gap(
         0,
         fields,
         include_score,
+        sort,
     )?;
 
     // 3. Collect gap _ids for dedup
@@ -169,6 +262,7 @@ pub fn search_dsl_with_gap(
         0,
         fields,
         include_score,
+        sort,
     )?;
 
     let filtered_persistent: Vec<SearchHit> = persistent_hits
@@ -283,6 +377,7 @@ pub fn search_with_gap(
     fields: Option<&[String]>,
     include_score: bool,
     gap_rows: &[serde_json::Value],
+    sort: Option<&str>,
 ) -> Result<Vec<SearchHit>> {
     if gap_rows.is_empty() {
         return search(
@@ -293,6 +388,7 @@ pub fn search_with_gap(
             offset,
             fields,
             include_score,
+            sort,
         );
     }
 
@@ -308,6 +404,7 @@ pub fn search_with_gap(
         0,
         fields,
         include_score,
+        sort,
     )?;
 
     // 3. Collect gap _ids for dedup
@@ -330,6 +427,7 @@ pub fn search_with_gap(
         0,
         fields,
         include_score,
+        sort,
     )?;
 
     let filtered_persistent: Vec<SearchHit> = persistent_hits
@@ -466,7 +564,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (index, schema, _) = setup_test_index(dir.path());
 
-        let results = search(&index, &schema, r#"+name:"glucose""#, 10, 0, None, false).unwrap();
+        let results = search(
+            &index,
+            &schema,
+            r#"+name:"glucose""#,
+            10,
+            0,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(results.len(), 2);
         for hit in &results {
             assert_eq!(hit.doc["name"], "glucose");
@@ -479,7 +587,7 @@ mod tests {
         let (index, schema, _) = setup_test_index(dir.path());
 
         // "diabetes" should match "diabetic" via en_stem tokenizer
-        let results = search(&index, &schema, "notes:diabetes", 10, 0, None, false).unwrap();
+        let results = search(&index, &schema, "notes:diabetes", 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc["_id"], "d2");
     }
@@ -519,6 +627,7 @@ mod tests {
             0,
             Some(&fields),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(results.len(), 2);
@@ -535,7 +644,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (index, schema, _) = setup_test_index(dir.path());
 
-        let results = search(&index, &schema, "notes:blood", 10, 0, None, true).unwrap();
+        let results = search(&index, &schema, "notes:blood", 10, 0, None, true, None).unwrap();
         assert!(!results.is_empty());
         for hit in &results {
             assert!(hit.doc.get("_score").is_some());
@@ -548,13 +657,43 @@ mod tests {
         let (index, schema, _) = setup_test_index(dir.path());
 
         // All docs match __present__:__all__
-        let all = search(&index, &schema, "+__present__:__all__", 10, 0, None, false).unwrap();
+        let all = search(
+            &index,
+            &schema,
+            "+__present__:__all__",
+            10,
+            0,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(all.len(), 3);
 
-        let limited = search(&index, &schema, "+__present__:__all__", 2, 0, None, false).unwrap();
+        let limited = search(
+            &index,
+            &schema,
+            "+__present__:__all__",
+            2,
+            0,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(limited.len(), 2);
 
-        let offset = search(&index, &schema, "+__present__:__all__", 10, 2, None, false).unwrap();
+        let offset = search(
+            &index,
+            &schema,
+            "+__present__:__all__",
+            10,
+            2,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(offset.len(), 1);
     }
 
@@ -593,7 +732,7 @@ mod tests {
         ];
 
         let index = build_ephemeral_index(&schema, &rows).unwrap();
-        let results = search(&index, &schema, "notes:diabetes", 10, 0, None, false).unwrap();
+        let results = search(&index, &schema, "notes:diabetes", 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc["_id"], "d2");
     }
@@ -637,6 +776,7 @@ mod tests {
             None,
             false,
             &gap_rows,
+            None,
         )
         .unwrap();
 
@@ -664,6 +804,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(results.len(), 3);
@@ -709,7 +850,7 @@ mod tests {
         let (index, schema, _) = setup_test_index(dir.path());
 
         let dsl = r#"{"term": {"name": "glucose"}}"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 2);
         for hit in &results {
             assert_eq!(hit.doc["name"], "glucose");
@@ -722,7 +863,7 @@ mod tests {
         let (index, schema, _) = setup_test_index(dir.path());
 
         let dsl = r#"{"match": {"notes": "diabetes"}}"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc["_id"], "d2");
     }
@@ -733,7 +874,7 @@ mod tests {
         let (index, schema, _) = setup_test_index(dir.path());
 
         let dsl = r#"{"match_all": {}}"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -748,7 +889,7 @@ mod tests {
                 "must_not": [{"match": {"notes": "postprandial"}}]
             }
         }"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc["notes"], "fasting blood sample");
     }
@@ -759,7 +900,7 @@ mod tests {
         let (index, schema, _) = setup_test_index(dir.path());
 
         let dsl = "not json";
-        let result = search_dsl(&index, &schema, dsl, 10, 0, None, false);
+        let result = search_dsl(&index, &schema, dsl, 10, 0, None, false, None);
         assert!(result.is_err());
     }
 
@@ -769,10 +910,10 @@ mod tests {
         let (index, schema, _) = setup_test_index(dir.path());
 
         let dsl = r#"{"match_all": {}}"#;
-        let results = search_dsl(&index, &schema, dsl, 2, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 2, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 2);
 
-        let results = search_dsl(&index, &schema, dsl, 10, 2, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 2, None, false, None).unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -827,7 +968,7 @@ mod tests {
         let (index, schema, _) = setup_full_test_index(dir.path());
 
         let dsl = r#"{"term": {"name": "glucose"}}"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 2);
         for hit in &results {
             assert_eq!(hit.doc["name"], "glucose");
@@ -840,7 +981,7 @@ mod tests {
         let (index, schema, _) = setup_full_test_index(dir.path());
 
         let dsl = r#"{"terms": {"name": ["glucose", "a1c"]}}"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -850,7 +991,7 @@ mod tests {
         let (index, schema, _) = setup_full_test_index(dir.path());
 
         let dsl = r#"{"match": {"notes": "diabetes"}}"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc["_id"], "d2");
     }
@@ -861,7 +1002,7 @@ mod tests {
         let (index, schema, _) = setup_full_test_index(dir.path());
 
         let dsl = r#"{"match_phrase": {"notes": "fasting blood"}}"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc["_id"], "d1");
     }
@@ -872,7 +1013,7 @@ mod tests {
         let (index, schema, _) = setup_full_test_index(dir.path());
 
         let dsl = r#"{"range": {"age": {"gte": 50}}}"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -882,7 +1023,7 @@ mod tests {
         let (index, schema, _) = setup_full_test_index(dir.path());
 
         let dsl = r#"{"range": {"created_at": {"gte": "2024-06-01T00:00:00Z"}}}"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -892,7 +1033,7 @@ mod tests {
         let (index, schema, _) = setup_full_test_index(dir.path());
 
         let dsl = r#"{"exists": {"field": "name"}}"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 4);
     }
 
@@ -907,7 +1048,7 @@ mod tests {
                 "filter": [{"range": {"age": {"gte": 40}}}]
             }
         }"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc["_id"], "d1");
     }
@@ -918,7 +1059,7 @@ mod tests {
         let (index, schema, _) = setup_full_test_index(dir.path());
 
         let dsl = r#"{"match_all": {}}"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 4);
     }
 
@@ -928,7 +1069,7 @@ mod tests {
         let (index, schema, _) = setup_full_test_index(dir.path());
 
         let dsl = r#"{"match_none": {}}"#;
-        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false).unwrap();
+        let results = search_dsl(&index, &schema, dsl, 10, 0, None, false, None).unwrap();
         assert_eq!(results.len(), 0);
     }
 
@@ -950,12 +1091,268 @@ mod tests {
 
         let dsl = r#"{"term": {"name": "glucose"}}"#;
         let results =
-            search_dsl_with_gap(&index, &schema, dsl, 10, 0, None, false, &gap_rows).unwrap();
+            search_dsl_with_gap(&index, &schema, dsl, 10, 0, None, false, &gap_rows, None).unwrap();
         // d1 (gap), d3 (index), d5 (gap) = 3 glucose docs
         assert_eq!(results.len(), 3);
 
         // gap d1 should have updated notes
         let d1 = results.iter().find(|h| h.doc["_id"] == "d1").unwrap();
         assert_eq!(d1.doc["notes"], "UPDATED fasting");
+    }
+
+    // --- Sort tests ---
+
+    #[test]
+    fn test_parse_sort_default_desc() {
+        let spec = parse_sort("age");
+        assert_eq!(spec.field_name, "age");
+        assert!(matches!(spec.order, Order::Desc));
+    }
+
+    #[test]
+    fn test_parse_sort_asc() {
+        let spec = parse_sort("age:asc");
+        assert_eq!(spec.field_name, "age");
+        assert!(matches!(spec.order, Order::Asc));
+    }
+
+    #[test]
+    fn test_parse_sort_desc_explicit() {
+        let spec = parse_sort("created_at:desc");
+        assert_eq!(spec.field_name, "created_at");
+        assert!(matches!(spec.order, Order::Desc));
+    }
+
+    #[test]
+    fn test_sort_by_numeric_field_desc() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        // Sort by age descending (default)
+        let results = search(
+            &index,
+            &schema,
+            "+__present__:__all__",
+            10,
+            0,
+            None,
+            false,
+            Some("age"),
+        )
+        .unwrap();
+        assert_eq!(results.len(), 4);
+        // d2 (62) should be first, then d4 (55), d1 (45), d3 (33)
+        assert_eq!(results[0].doc["_id"], "d2");
+        assert_eq!(results[1].doc["_id"], "d4");
+        assert_eq!(results[2].doc["_id"], "d1");
+        assert_eq!(results[3].doc["_id"], "d3");
+    }
+
+    #[test]
+    fn test_sort_by_numeric_field_asc() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        // Sort by age ascending
+        let results = search(
+            &index,
+            &schema,
+            "+__present__:__all__",
+            10,
+            0,
+            None,
+            false,
+            Some("age:asc"),
+        )
+        .unwrap();
+        assert_eq!(results.len(), 4);
+        // d3 (33) should be first, then d1 (45), d4 (55), d2 (62)
+        assert_eq!(results[0].doc["_id"], "d3");
+        assert_eq!(results[1].doc["_id"], "d1");
+        assert_eq!(results[2].doc["_id"], "d4");
+        assert_eq!(results[3].doc["_id"], "d2");
+    }
+
+    #[test]
+    fn test_sort_by_date_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        // Sort by created_at descending (most recent first)
+        let results = search(
+            &index,
+            &schema,
+            "+__present__:__all__",
+            10,
+            0,
+            None,
+            false,
+            Some("created_at:desc"),
+        )
+        .unwrap();
+        assert_eq!(results.len(), 4);
+        // d3 (2024-09-01) > d1 (2024-06-15) > d2 (2024-03-20) > d4 (2024-01-10)
+        assert_eq!(results[0].doc["_id"], "d3");
+        assert_eq!(results[1].doc["_id"], "d1");
+        assert_eq!(results[2].doc["_id"], "d2");
+        assert_eq!(results[3].doc["_id"], "d4");
+    }
+
+    #[test]
+    fn test_sort_by_date_field_asc() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        // Sort by created_at ascending (oldest first)
+        let results = search(
+            &index,
+            &schema,
+            "+__present__:__all__",
+            10,
+            0,
+            None,
+            false,
+            Some("created_at:asc"),
+        )
+        .unwrap();
+        assert_eq!(results.len(), 4);
+        // d4 (2024-01-10) < d2 (2024-03-20) < d1 (2024-06-15) < d3 (2024-09-01)
+        assert_eq!(results[0].doc["_id"], "d4");
+        assert_eq!(results[1].doc["_id"], "d2");
+        assert_eq!(results[2].doc["_id"], "d1");
+        assert_eq!(results[3].doc["_id"], "d3");
+    }
+
+    #[test]
+    fn test_sort_rejects_keyword_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let result = search(
+            &index,
+            &schema,
+            "+__present__:__all__",
+            10,
+            0,
+            None,
+            false,
+            Some("name"),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("must be numeric or date"));
+    }
+
+    #[test]
+    fn test_sort_rejects_text_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let result = search(
+            &index,
+            &schema,
+            "+__present__:__all__",
+            10,
+            0,
+            None,
+            false,
+            Some("notes"),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("must be numeric or date"));
+    }
+
+    #[test]
+    fn test_sort_rejects_unknown_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let result = search(
+            &index,
+            &schema,
+            "+__present__:__all__",
+            10,
+            0,
+            None,
+            false,
+            Some("nonexistent"),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not in schema"));
+    }
+
+    #[test]
+    fn test_sort_with_limit_and_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        // Sort by age desc, take 2
+        let results = search(
+            &index,
+            &schema,
+            "+__present__:__all__",
+            2,
+            0,
+            None,
+            false,
+            Some("age"),
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].doc["_id"], "d2"); // age 62
+        assert_eq!(results[1].doc["_id"], "d4"); // age 55
+
+        // Sort by age desc, skip 2, take 2
+        let results = search(
+            &index,
+            &schema,
+            "+__present__:__all__",
+            2,
+            2,
+            None,
+            false,
+            Some("age"),
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].doc["_id"], "d1"); // age 45
+        assert_eq!(results[1].doc["_id"], "d3"); // age 33
+    }
+
+    #[test]
+    fn test_sort_dsl_by_numeric() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let dsl = r#"{"match_all": {}}"#;
+        let results =
+            search_dsl(&index, &schema, dsl, 10, 0, None, false, Some("age:asc")).unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].doc["_id"], "d3"); // age 33
+        assert_eq!(results[3].doc["_id"], "d2"); // age 62
+    }
+
+    #[test]
+    fn test_sort_score_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, schema, _) = setup_full_test_index(dir.path());
+
+        let results = search(
+            &index,
+            &schema,
+            "+__present__:__all__",
+            10,
+            0,
+            None,
+            false,
+            Some("age"),
+        )
+        .unwrap();
+        // When sorting, BM25 score should be 0.0
+        for hit in &results {
+            assert_eq!(hit.score, 0.0);
+        }
     }
 }

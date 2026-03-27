@@ -739,6 +739,7 @@ mod tests {
             None,
             false,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -762,6 +763,7 @@ mod tests {
             None,
             false,
             &gap_rows,
+            None,
         )
         .unwrap();
         assert_eq!(results.len(), 2);
