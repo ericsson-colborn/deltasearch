@@ -15,7 +15,7 @@ path = "src/main.rs"
 tantivy = "0.25"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

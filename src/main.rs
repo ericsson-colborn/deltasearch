@@ -59,8 +59,8 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Data directory for indexes
-    #[arg(long, global = true, default_value = ".dsrch")]
+    /// Data directory for indexes (also settable via DSRCH_DATA_DIR env var)
+    #[arg(long, global = true, default_value = ".dsrch", env = "DSRCH_DATA_DIR")]
     data_dir: String,
 
     /// Output format: json or text (default: text in terminal, json when piped)
