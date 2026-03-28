@@ -37,7 +37,7 @@ pub struct DeltaChanges {
 /// - File-level diffing: rewritten files (OPTIMIZE) are re-read, but
 ///   upsert by _id handles deduplication
 /// - If removed files have been vacuumed, a warning is logged and
-///   `dsrch reindex` is recommended
+///   `dewey reindex` is recommended
 pub struct DeltaSync {
     source: String,
 }
@@ -131,7 +131,7 @@ impl DeltaSync {
     /// Detects both new Parquet files (added rows) and removed Parquet files
     /// (deleted rows). For removed files, attempts to read them and extract
     /// `_id` values for deletion from the index. If a removed file has been
-    /// vacuumed (physically deleted), logs a warning — `dsrch reindex` is the
+    /// vacuumed (physically deleted), logs a warning — `dewey reindex` is the
     /// fallback for that edge case.
     ///
     /// If last_version < 0 (never synced), treats all rows as added.
@@ -331,7 +331,7 @@ async fn stream_parquet_via_store(
         let data = match fetch_parquet_bytes(store, path).await {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[dsrch] warning: cannot read {}: {e}", path);
+                eprintln!("[dewey] warning: cannot read {}: {e}", path);
                 continue;
             }
         };
@@ -433,8 +433,8 @@ async fn extract_ids_via_store(store: &dyn ObjectStore, paths: &[&StorePath]) ->
 
     if unreadable > 0 {
         eprintln!(
-            "[dsrch] WARNING: {unreadable} removed file(s) could not be read (vacuumed?). \
-             Run 'dsrch reindex' for a full rebuild."
+            "[dewey] WARNING: {unreadable} removed file(s) could not be read (vacuumed?). \
+             Run 'dewey reindex' for a full rebuild."
         );
     }
 

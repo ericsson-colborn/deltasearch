@@ -25,14 +25,14 @@ pub async fn run(
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     if total_rows == 0 {
-        eprintln!("[dsrch] No rows to ingest");
+        eprintln!("[dewey] No rows to ingest");
         return Ok(());
     }
 
-    eprintln!("[dsrch] Read {total_rows} row(s) from source");
+    eprintln!("[dewey] Read {total_rows} row(s) from source");
 
     let version = ingest::write_delta(delta_uri, batches, write_mode).await?;
-    eprintln!("[dsrch] Wrote {total_rows} row(s) to Delta table at version {version}");
+    eprintln!("[dewey] Wrote {total_rows} row(s) to Delta table at version {version}");
 
     Ok(())
 }
@@ -44,7 +44,7 @@ fn read_from_source(
     batch_size: usize,
 ) -> Result<Vec<RecordBatch>> {
     let files = ingest::expand_source(source)?;
-    eprintln!("[dsrch] Found {} source file(s)", files.len());
+    eprintln!("[dewey] Found {} source file(s)", files.len());
 
     let mut all_batches = Vec::new();
     for file_path in &files {
@@ -60,7 +60,7 @@ fn read_from_source(
 
         let batches = ingest::read_file(file_path, format, batch_size)?;
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        eprintln!("[dsrch]   {file_path}: {rows} row(s)");
+        eprintln!("[dewey]   {file_path}: {rows} row(s)");
         all_batches.extend(batches);
     }
 
@@ -82,7 +82,7 @@ fn read_from_stdin(format_override: Option<&str>, batch_size: usize) -> Result<V
         ));
     }
 
-    eprintln!("[dsrch] Reading from stdin ({format_str})");
+    eprintln!("[dewey] Reading from stdin ({format_str})");
     let stdin = std::io::stdin();
     ingest::read_from_reader(stdin.lock(), format, batch_size)
 }

@@ -76,7 +76,7 @@ pub fn run(
         println!("{}", serde_json::to_string_pretty(&agg_results)?);
     }
 
-    eprintln!("[dsrch] {} result(s)", results.len());
+    eprintln!("[dewey] {} result(s)", results.len());
     Ok(())
 }
 

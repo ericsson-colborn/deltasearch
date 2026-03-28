@@ -22,7 +22,7 @@ pub async fn run(
                 "index '{name}' not found. Use --source <delta-uri> to create it"
             ))
         })?;
-        eprintln!("[dsrch] compact: index '{name}' not found, creating from Delta source...");
+        eprintln!("[dewey] compact: index '{name}' not found, creating from Delta source...");
         super::connect_delta::run(storage, name, source, schema_json, false).await?;
     } else if let Some(source) = source {
         // Index exists but --source provided: update the Delta source
@@ -30,7 +30,7 @@ pub async fn run(
         if config.delta_source.as_deref() != Some(source) {
             config.delta_source = Some(source.to_string());
             storage.save_config(name, &config)?;
-            eprintln!("[dsrch] compact: updated Delta source to {source}");
+            eprintln!("[dewey] compact: updated Delta source to {source}");
         }
     }
 
@@ -64,17 +64,17 @@ pub async fn run(
                     .expect("failed to install SIGTERM handler");
             tokio::select! {
                 _ = ctrl_c => {
-                    eprintln!("\n[dsrch] compact: received SIGINT, shutting down gracefully...");
+                    eprintln!("\n[dewey] compact: received SIGINT, shutting down gracefully...");
                 }
                 _ = sigterm.recv() => {
-                    eprintln!("[dsrch] compact: received SIGTERM, shutting down gracefully...");
+                    eprintln!("[dewey] compact: received SIGTERM, shutting down gracefully...");
                 }
             }
         }
         #[cfg(not(unix))]
         {
             ctrl_c.await.ok();
-            eprintln!("\n[dsrch] compact: received Ctrl+C, shutting down gracefully...");
+            eprintln!("\n[dewey] compact: received Ctrl+C, shutting down gracefully...");
         }
         let _ = shutdown_tx.send(true);
     });

@@ -129,14 +129,14 @@ pub async fn start_metrics_server(addr: String, registry: Registry) {
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[dsrch] metrics: failed to bind {addr}: {e}");
+            eprintln!("[dewey] metrics: failed to bind {addr}: {e}");
             return;
         }
     };
 
-    eprintln!("[dsrch] metrics: serving on http://{addr}/metrics");
+    eprintln!("[dewey] metrics: serving on http://{addr}/metrics");
     if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("[dsrch] metrics: server error: {e}");
+        eprintln!("[dewey] metrics: server error: {e}");
     }
 }
 

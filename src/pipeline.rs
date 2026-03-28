@@ -111,7 +111,7 @@ pub fn run_pipeline(
                     }
                     Err(e) => {
                         errs += 1;
-                        eprintln!("[dsrch] pipeline: doc build error: {e}");
+                        eprintln!("[dewey] pipeline: doc build error: {e}");
                     }
                 }
             }

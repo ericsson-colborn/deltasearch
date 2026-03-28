@@ -51,16 +51,22 @@ impl OutputFormat {
 
 #[derive(Parser)]
 #[command(
-    name = "dsrch",
-    about = "deltasearch — ES in your pocket. Embedded search backed by tantivy + Delta Lake.",
+    name = "dewey",
+    about = "Dewey — search your lakehouse. Embedded search backed by tantivy + Delta Lake.",
     version
 )]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Data directory for indexes (also settable via DSRCH_DATA_DIR env var)
-    #[arg(long, global = true, default_value = ".dsrch", env = "DSRCH_DATA_DIR")]
+    /// Data directory for indexes (also settable via DEWEY_DATA_DIR env var)
+    #[arg(
+        long,
+        short = 'd',
+        global = true,
+        default_value = ".dewey",
+        env = "DEWEY_DATA_DIR"
+    )]
     data_dir: String,
 
     /// Output format: json or text (default: text in terminal, json when piped)
@@ -377,7 +383,7 @@ async fn read_gap(storage: &Storage, name: &str) -> (Vec<serde_json::Value>, i64
     let current_version = match delta_sync.current_version().await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[dsrch] Delta read warning: {e}");
+            eprintln!("[dewey] Delta read warning: {e}");
             return (vec![], 0);
         }
     };
@@ -391,7 +397,7 @@ async fn read_gap(storage: &Storage, name: &str) -> (Vec<serde_json::Value>, i64
     let rows = match delta_sync.rows_added_since(index_version).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[dsrch] Delta gap read warning: {e}");
+            eprintln!("[dewey] Delta gap read warning: {e}");
             return (vec![], gap_versions);
         }
     };
@@ -477,7 +483,7 @@ fn handle_error(result: error::Result<()>, fmt: OutputFormat) {
                 eprintln!("{}", serde_json::to_string(&error_json).unwrap());
             }
             OutputFormat::Text => {
-                eprintln!("[dsrch] Error: {e}");
+                eprintln!("[dewey] Error: {e}");
             }
         }
         std::process::exit(1);

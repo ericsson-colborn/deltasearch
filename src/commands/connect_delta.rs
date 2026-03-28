@@ -24,7 +24,7 @@ pub async fn run(
     // Open Delta table and get current version
     let delta = DeltaSync::new(source);
     let version = delta.current_version().await?;
-    eprintln!("[dsrch] Delta table at version {version}");
+    eprintln!("[dewey] Delta table at version {version}");
 
     let (schema, inferred) = match schema_json {
         Some(json) => (Schema::from_json(json)?, false),
@@ -32,7 +32,7 @@ pub async fn run(
             let arrow_schema = delta.arrow_schema().await?;
             let schema = crate::schema::from_arrow_schema(&arrow_schema);
             eprintln!(
-                "[dsrch] Inferred schema from Arrow: {} field(s)",
+                "[dewey] Inferred schema from Arrow: {} field(s)",
                 schema.fields.len()
             );
             (schema, true)
@@ -49,7 +49,7 @@ pub async fn run(
 
     // Full load all rows
     let rows = delta.full_load(None).await?;
-    eprintln!("[dsrch] Loaded {} row(s) from Delta", rows.len());
+    eprintln!("[dewey] Loaded {} row(s) from Delta", rows.len());
 
     // Create index on disk
     storage.create_dirs(name)?;
@@ -81,6 +81,6 @@ pub async fn run(
     };
     storage.save_config(name, &config)?;
 
-    eprintln!("[dsrch] Created index '{name}' with {count} document(s) from Delta v{version}");
+    eprintln!("[dewey] Created index '{name}' with {count} document(s) from Delta v{version}");
     Ok(())
 }
