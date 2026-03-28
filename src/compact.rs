@@ -75,7 +75,7 @@ impl<'a> CompactWorker<'a> {
         let config = self.storage.load_config(&self.name)?;
         let source = config.delta_source.as_deref().ok_or_else(|| {
             SearchDbError::Delta(format!(
-                "index '{}' has no Delta source — use compact --source <uri>",
+                "index '{}' has no Delta source — use 'dewey create --source' first",
                 self.name
             ))
         })?;
@@ -100,7 +100,7 @@ impl<'a> CompactWorker<'a> {
 
         // Handle --force-merge: merge all segments and exit
         if self.opts.force_merge {
-            eprintln!("[dewey] compact: force-merging all segments...");
+            eprintln!("[dewey] librarian: force-merging all segments...");
             self.force_merge_all(&index, &mut index_writer).await?;
         } else {
             let mut last_merge_check = Instant::now();
@@ -108,7 +108,7 @@ impl<'a> CompactWorker<'a> {
             // Main loop
             loop {
                 if *shutdown.borrow() {
-                    eprintln!("[dewey] compact: shutdown signal received, finishing...");
+                    eprintln!("[dewey] librarian: shutdown signal received, finishing...");
                     break;
                 }
 
@@ -126,7 +126,7 @@ impl<'a> CompactWorker<'a> {
                 if !segmented {
                     let current_config = self.storage.load_config(&self.name)?;
                     let index_version = current_config.index_version.unwrap_or(-1);
-                    eprintln!("[dewey] compact: up to date at Delta v{index_version}");
+                    eprintln!("[dewey] librarian: up to date at Delta v{index_version}");
                 }
 
                 // Level 2: Check for merge opportunity
@@ -150,7 +150,7 @@ impl<'a> CompactWorker<'a> {
 
         // Clean shutdown — consumes the writer
         index_writer.wait_merging_threads()?;
-        eprintln!("[dewey] compact: shutdown complete");
+        eprintln!("[dewey] librarian: shutdown complete");
         Ok(())
     }
 
@@ -196,7 +196,7 @@ impl<'a> CompactWorker<'a> {
 
         let gap = current_version - index_version;
         eprintln!(
-            "[dewey] compact: polling Delta... HEAD={current_version}, \
+            "[dewey] librarian: polling Delta... HEAD={current_version}, \
              index={index_version}, gap={gap} versions"
         );
 
@@ -210,7 +210,9 @@ impl<'a> CompactWorker<'a> {
         if !removed_ids.is_empty() {
             let del_count = writer::delete_documents(index_writer, id_field, &removed_ids);
             index_writer.commit()?;
-            eprintln!("[dewey] compact: deleted {del_count} document(s) from removed Delta files");
+            eprintln!(
+                "[dewey] librarian: deleted {del_count} document(s) from removed Delta files"
+            );
 
             #[cfg(feature = "metrics")]
             if let Some(ref m) = self.metrics {
@@ -239,7 +241,7 @@ impl<'a> CompactWorker<'a> {
                 )?;
                 index_writer.commit()?;
                 total_docs += stats.docs_indexed;
-                eprintln!("[dewey] compact: committed segment {batch_num} ({batch_len} docs)");
+                eprintln!("[dewey] librarian: committed segment {batch_num} ({batch_len} docs)");
 
                 #[cfg(feature = "metrics")]
                 if let Some(ref m) = self.metrics {
@@ -263,7 +265,7 @@ impl<'a> CompactWorker<'a> {
             )?;
             index_writer.commit()?;
             total_docs += stats.docs_indexed;
-            eprintln!("[dewey] compact: committed segment {batch_num} ({batch_len} docs)");
+            eprintln!("[dewey] librarian: committed segment {batch_num} ({batch_len} docs)");
 
             #[cfg(feature = "metrics")]
             if let Some(ref m) = self.metrics {
@@ -272,7 +274,7 @@ impl<'a> CompactWorker<'a> {
         }
 
         if total_docs == 0 && removed_ids.is_empty() {
-            eprintln!("[dewey] compact: no changes to process");
+            eprintln!("[dewey] librarian: no changes to process");
             current_config.index_version = Some(current_version);
             self.save_config_with_compact(&current_config)?;
 
@@ -300,7 +302,7 @@ impl<'a> CompactWorker<'a> {
         }
 
         eprintln!(
-            "[dewey] compact: indexed {total_docs} docs in {batch_num} segment(s), now at Delta v{current_version}"
+            "[dewey] librarian: indexed {total_docs} docs in {batch_num} segment(s), now at Delta v{current_version}"
         );
         Ok(total_docs > 0 || !removed_ids.is_empty())
     }
@@ -314,7 +316,7 @@ impl<'a> CompactWorker<'a> {
         let segment_metas = self.read_segment_metas(index)?;
         let segment_count = segment_metas.len();
 
-        eprintln!("[dewey] compact: merge check: {segment_count} segments");
+        eprintln!("[dewey] librarian: merge check: {segment_count} segments");
 
         #[cfg(feature = "metrics")]
         if let Some(ref m) = self.metrics {
@@ -329,7 +331,7 @@ impl<'a> CompactWorker<'a> {
         let merge_ops = policy.operations(&segment_metas);
 
         if merge_ops.is_empty() {
-            eprintln!("[dewey] compact: no merge needed");
+            eprintln!("[dewey] librarian: no merge needed");
             return Ok(());
         }
 
@@ -341,7 +343,7 @@ impl<'a> CompactWorker<'a> {
             }
 
             eprintln!(
-                "[dewey] compact: merge operation {}/{}: merging {} segments...",
+                "[dewey] librarian: merge operation {}/{}: merging {} segments...",
                 i + 1,
                 merge_ops.len(),
                 ids.len()
@@ -352,7 +354,7 @@ impl<'a> CompactWorker<'a> {
 
             match index_writer.merge(&ids).await {
                 Ok(_) => {
-                    eprintln!("[dewey] compact: merged {} segments into 1", ids.len());
+                    eprintln!("[dewey] librarian: merged {} segments into 1", ids.len());
                     did_merge = true;
 
                     #[cfg(feature = "metrics")]
@@ -363,7 +365,7 @@ impl<'a> CompactWorker<'a> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[dewey] compact: merge failed: {e}");
+                    eprintln!("[dewey] librarian: merge failed: {e}");
 
                     #[cfg(feature = "metrics")]
                     if let Some(ref m) = self.metrics {
@@ -453,21 +455,21 @@ impl<'a> CompactWorker<'a> {
 
         if segment_ids.len() <= 1 {
             eprintln!(
-                "[dewey] compact: already {} segment(s), nothing to merge",
+                "[dewey] librarian: already {} segment(s), nothing to merge",
                 segment_ids.len()
             );
             return Ok(());
         }
 
         eprintln!(
-            "[dewey] compact: force-merging {} segments into 1...",
+            "[dewey] librarian: force-merging {} segments into 1...",
             segment_ids.len()
         );
 
         let merge_future = index_writer.merge(&segment_ids);
         match merge_future.await {
             Ok(_) => {
-                eprintln!("[dewey] compact: force-merge complete");
+                eprintln!("[dewey] librarian: force-merge complete");
             }
             Err(e) => {
                 return Err(SearchDbError::Tantivy(e));

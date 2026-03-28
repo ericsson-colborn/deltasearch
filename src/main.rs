@@ -166,18 +166,11 @@ enum Commands {
         as_of_version: Option<i64>,
     },
 
-    /// Run the compaction worker (segment creation + merge).
-    /// If the index doesn't exist, creates it and performs initial load from --source.
+    /// Run the librarian — keeps the index fresh from Delta Lake
     #[cfg(feature = "delta")]
-    Compact {
+    Librarian {
         /// Index name
         name: String,
-        /// Delta Lake source (path or URI). Required on first run, saved for subsequent runs.
-        #[arg(long)]
-        source: Option<String>,
-        /// Schema JSON (optional — inferred from Delta's Arrow schema if omitted)
-        #[arg(long)]
-        schema: Option<String>,
         /// Rows per segment before commit
         #[arg(long, default_value_t = 10_000)]
         segment_size: usize,
@@ -308,10 +301,8 @@ async fn run_cli() {
             name,
             as_of_version,
         } => commands::reindex::run(&storage, &name, as_of_version).await,
-        Commands::Compact {
+        Commands::Librarian {
             name,
-            source,
-            schema,
             segment_size,
             merge_interval,
             max_segments,
@@ -335,8 +326,6 @@ async fn run_cli() {
                 &storage,
                 &name,
                 opts,
-                source.as_deref(),
-                schema.as_deref(),
                 #[cfg(feature = "metrics")]
                 metrics_port,
             )
