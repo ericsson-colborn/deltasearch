@@ -198,15 +198,13 @@ enum Commands {
         metrics_port: u16,
     },
 
-    /// Ingest raw files (NDJSON, JSON, CSV, Parquet) into a Delta Lake table
+    /// Convert raw files (NDJSON, JSON, CSV, Parquet) into a Delta Lake table
     #[cfg(feature = "delta")]
-    Ingest {
-        /// Source file(s) — glob pattern or single path (omit for stdin)
-        #[arg(long)]
-        source: Option<String>,
+    ToDelta {
+        /// Source file(s) — glob pattern, single path, or - for stdin
+        source: String,
         /// Delta Lake table destination (path or URI)
-        #[arg(long)]
-        delta: String,
+        target: String,
         /// File format: ndjson, json, csv, parquet (auto-detected from extension)
         #[arg(long)]
         format: Option<String>,
@@ -330,21 +328,19 @@ async fn run_cli() {
             )
             .await
         }
-        Commands::Ingest {
+        Commands::ToDelta {
             source,
-            delta,
+            target,
             format,
             mode,
             batch_size,
         } => {
-            commands::ingest::run(
-                source.as_deref(),
-                &delta,
-                format.as_deref(),
-                &mode,
-                batch_size,
-            )
-            .await
+            let src = if source == "-" {
+                None
+            } else {
+                Some(source.as_str())
+            };
+            commands::ingest::run(src, &target, format.as_deref(), &mode, batch_size).await
         }
     };
 
