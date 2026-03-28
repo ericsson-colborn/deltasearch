@@ -223,6 +223,10 @@ enum Commands {
 #[cfg(feature = "delta")]
 #[tokio::main]
 async fn main() {
+    // Register cloud storage handlers so deltalake recognizes az://, s3://, gs:// URIs
+    deltalake::azure::register_handlers(None);
+    deltalake::aws::register_handlers(None);
+    deltalake::gcp::register_handlers(None);
     run_cli().await;
 }
 
