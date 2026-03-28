@@ -76,19 +76,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Create a new index (schema optional — inferred from data if omitted)
-    New {
+    /// Create a new index (schema inferred from Delta source or provided explicitly)
+    Create {
         /// Index name
         name: String,
+        /// Delta Lake source (path or URI) — schema inferred from Arrow metadata
+        #[arg(long)]
+        source: Option<String>,
         /// Schema JSON: {"fields":{"name":"keyword","notes":"text"}}
         #[arg(long)]
         schema: Option<String>,
         /// Overwrite if index already exists
         #[arg(long, default_value_t = false)]
         overwrite: bool,
-        /// Infer schema from an NDJSON sample file (file is NOT indexed)
-        #[arg(long)]
-        infer_from: Option<String>,
         /// Print inferred schema as JSON and exit without creating
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -242,20 +242,19 @@ async fn run_cli() {
     let fmt = OutputFormat::resolve(cli.output);
 
     let result = match cli.command {
-        Commands::New {
+        Commands::Create {
             name,
+            source,
             schema,
             overwrite,
-            infer_from,
             dry_run,
-        } => commands::new_index::run(
-            &storage,
-            &name,
-            schema.as_deref(),
-            overwrite,
-            infer_from.as_deref(),
-            dry_run,
-        ),
+        } => {
+            if let Some(ref src) = source {
+                create_from_delta(&storage, &name, src, overwrite, dry_run).await
+            } else {
+                commands::new_index::run(&storage, &name, schema.as_deref(), overwrite, dry_run)
+            }
+        }
         Commands::Index { name, file } => commands::index::run(&storage, &name, file.as_deref()),
         Commands::Search {
             name,
@@ -352,6 +351,34 @@ async fn run_cli() {
     handle_error(result, fmt);
 }
 
+/// Create an index from a Delta Lake source, inferring schema from Arrow metadata.
+#[cfg(feature = "delta")]
+async fn create_from_delta(
+    storage: &Storage,
+    name: &str,
+    src: &str,
+    overwrite: bool,
+    dry_run: bool,
+) -> error::Result<()> {
+    let delta = crate::delta::DeltaSync::new(src);
+    let arrow_schema = delta.arrow_schema().await.map_err(|e| {
+        crate::error::SearchDbError::Delta(format!("failed to read Delta schema: {e}"))
+    })?;
+    let inferred = crate::schema::from_arrow_schema(&arrow_schema);
+    let schema_json = serde_json::to_string(&inferred)?;
+
+    commands::new_index::run(storage, name, Some(&schema_json), overwrite, dry_run)?;
+
+    if !dry_run {
+        let mut config = storage.load_config(name)?;
+        config.delta_source = Some(src.to_string());
+        config.inferred = true;
+        storage.save_config(name, &config)?;
+        eprintln!("[dewey] Delta source set to {src}");
+    }
+    Ok(())
+}
+
 /// Read un-indexed Delta rows (the gap between index_version and HEAD).
 /// Returns (gap_rows, gap_size_in_versions) without acquiring any lock.
 #[cfg(feature = "delta")]
@@ -412,20 +439,13 @@ fn run_cli_sync() {
     let fmt = OutputFormat::resolve(cli.output);
 
     let result = match cli.command {
-        Commands::New {
+        Commands::Create {
             name,
             schema,
             overwrite,
-            infer_from,
             dry_run,
-        } => commands::new_index::run(
-            &storage,
-            &name,
-            schema.as_deref(),
-            overwrite,
-            infer_from.as_deref(),
-            dry_run,
-        ),
+            ..
+        } => commands::new_index::run(&storage, &name, schema.as_deref(), overwrite, dry_run),
         Commands::Index { name, file } => commands::index::run(&storage, &name, file.as_deref()),
         Commands::Search {
             name,

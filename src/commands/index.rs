@@ -160,7 +160,7 @@ mod tests {
     fn setup_index(dir: &std::path::Path) -> Storage {
         let storage = Storage::new(dir.to_str().unwrap());
         let schema_json = r#"{"fields":{"name":"keyword","notes":"text","age":"numeric"}}"#;
-        new_index::run(&storage, "test", Some(schema_json), false, None, false).unwrap();
+        new_index::run(&storage, "test", Some(schema_json), false, false).unwrap();
         storage
     }
 
@@ -242,7 +242,7 @@ mod tests {
         let storage = Storage::new(dir.path().to_str().unwrap());
 
         // Create index WITHOUT schema
-        new_index::run(&storage, "test", None, false, None, false).unwrap();
+        new_index::run(&storage, "test", None, false, false).unwrap();
 
         let ndjson_path = dir.path().join("data.ndjson");
         std::fs::write(
@@ -270,7 +270,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path().to_str().unwrap());
 
-        new_index::run(&storage, "test", None, false, None, false).unwrap();
+        new_index::run(&storage, "test", None, false, false).unwrap();
 
         // First batch
         let batch1 = dir.path().join("batch1.ndjson");
@@ -306,7 +306,7 @@ mod tests {
 
         // Create index WITH explicit schema (only "name")
         let schema_json = r#"{"fields":{"name":"keyword"}}"#;
-        new_index::run(&storage, "test", Some(schema_json), false, None, false).unwrap();
+        new_index::run(&storage, "test", Some(schema_json), false, false).unwrap();
 
         // Index doc with extra "age" field
         let ndjson = dir.path().join("data.ndjson");
@@ -328,7 +328,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path().to_str().unwrap());
 
-        new_index::run(&storage, "test", None, false, None, false).unwrap();
+        new_index::run(&storage, "test", None, false, false).unwrap();
 
         let ndjson = dir.path().join("data.ndjson");
         std::fs::write(
@@ -366,7 +366,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path().to_str().unwrap());
 
-        new_index::run(&storage, "test", None, false, None, false).unwrap();
+        new_index::run(&storage, "test", None, false, false).unwrap();
 
         // Batch 1
         let b1 = dir.path().join("b1.ndjson");
@@ -394,7 +394,7 @@ mod tests {
 
         // Create with partial schema: declare "notes" as text
         let schema_json = r#"{"fields":{"notes":"text"}}"#;
-        new_index::run(&storage, "test", Some(schema_json), false, None, false).unwrap();
+        new_index::run(&storage, "test", Some(schema_json), false, false).unwrap();
 
         // Manually set inferred=true so evolution is enabled
         let mut config = storage.load_config("test").unwrap();

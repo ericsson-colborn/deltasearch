@@ -26,7 +26,6 @@ mod tests {
             "test",
             Some(r#"{"fields":{"name":"keyword"}}"#),
             false,
-            None,
             false,
         )
         .unwrap();
